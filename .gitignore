@@ -1,0 +1,5 @@
+﻿__pycache__/
+*.py[cod]
+*$py.class
+sur_checkpoint_*.json
+sur_speed.json
