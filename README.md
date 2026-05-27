@@ -56,6 +56,8 @@ VHS_LoadVideo
 
 新版 Runner 会把每段子任务提交给当前浏览器客户端，ComfyUI 前端应能继续显示子任务正在执行的节点；日志中也会显示 `前端执行状态转发=开/关`。段后清理会优先调用本插件内置的 `SegmentDeepRAMCleanNode`，并输出清理前后的 RAM/VRAM；Runner 段后清理还会额外扫描并释放残留的 4 维 IMAGE/VIDEO CPU tensor，避免长分段任务 RAM 阶梯式上涨。`merge_segments` 新建节点默认开启，旧工作流如果关闭过该开关仍会按旧配置执行。
 
+如果 RAM 仍然阶梯式上涨，可以把 `SegmentFrameTrimmer.clone_output`（复制输出）打开。开启后 Trimmer 会复制裁剪后的输出并释放上游大张量 storage，通常能降低后续段的残留 CPU 内存；代价是保存前会有一次额外拷贝，峰值 RAM 会短暂升高。
+
 如果使用 `AIGODLIKE-COMFYUI-TRANSLATION` 中文包，它不会读取本插件的 `locales` 目录。可将 `aigodlike_translations/zh-CN/Nodes/Segment-Upscale-Runner.json` 复制到中文包的 `zh-CN/Nodes/` 目录，然后重启 ComfyUI。
 
 ## 裁剪与插帧

@@ -987,6 +987,24 @@ def _sur_trim_ram_os() -> bool:
         if platform.system() == "Windows":
             kernel32 = ctypes.windll.kernel32
             psapi = ctypes.windll.psapi
+            try:
+                msvcrt = ctypes.CDLL("msvcrt")
+                if hasattr(msvcrt, "_heapmin"):
+                    msvcrt._heapmin()
+            except Exception:
+                pass
+            try:
+                count = kernel32.GetProcessHeaps(0, None)
+                if count:
+                    heap_array = (ctypes.c_void_p * count)()
+                    got = kernel32.GetProcessHeaps(count, heap_array)
+                    for i in range(min(count, got)):
+                        try:
+                            kernel32.HeapCompact(heap_array[i], 0)
+                        except Exception:
+                            pass
+            except Exception:
+                pass
             handle = kernel32.GetCurrentProcess()
             kernel32.SetProcessWorkingSetSize(handle, ctypes.c_size_t(-1), ctypes.c_size_t(-1))
             psapi.EmptyWorkingSet(handle)
@@ -2025,9 +2043,15 @@ class SegmentFrameTrimmer:
         n           = images.shape[0]
         trim_frames = max(0, min(int(trim_frames), n - 1))
         if trim_frames > 0:
-            out = images[trim_frames:]
             if clone_output:
-                out = out.clone()
+                out = images[trim_frames:].clone()
+                _sur_zero_tensor_storage(images)
+            else:
+                out = images[trim_frames:]
+            return (out,)
+        if clone_output:
+            out = images.clone()
+            _sur_zero_tensor_storage(images)
             return (out,)
         return (images,)
 
@@ -2562,6 +2586,7 @@ class SegmentUpscaleRunner:
                     subfolder   = orig_prefix[:slash + 1] if slash >= 0 else ""
                     wf[combine_nid]["inputs"]["filename_prefix"] = subfolder + seg_prefix
                     wf[combine_nid]["inputs"]["save_output"]     = True
+                    wf[combine_nid]["inputs"]["save_metadata"]   = False
 
                     # 4. 可选：按段替换参考图、按段切音频
                     _sur_set_segment_reference_image(
