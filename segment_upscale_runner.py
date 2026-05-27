@@ -709,6 +709,13 @@ def _sur_base_video_start_time(prompt: dict, load_nid: str) -> float:
         return 0.0
 
 
+def _sur_base_video_skip_frames(prompt: dict, load_nid: str) -> int:
+    try:
+        return max(0, int(_node_inputs((prompt or {}).get(str(load_nid), {})).get("skip_first_frames", 0) or 0))
+    except Exception:
+        return 0
+
+
 def _sur_set_load_video_segment(
     wf: dict,
     load_nid: str,
@@ -716,6 +723,7 @@ def _sur_set_load_video_segment(
     load_limit: int,
     frame_rate: float,
     base_start_time: float = 0.0,
+    base_skip_frames: int = 0,
     log=None,
 ):
     node = wf.get(str(load_nid))
@@ -726,9 +734,10 @@ def _sur_set_load_video_segment(
     inputs["frame_load_cap"] = int(load_limit)
 
     if "skip_first_frames" in inputs:
-        inputs["skip_first_frames"] = int(load_skip)
+        absolute_skip = int(base_skip_frames) + int(load_skip)
+        inputs["skip_first_frames"] = absolute_skip
         if log:
-            log(f"  LoadVideo: skip_first_frames={load_skip} frame_load_cap={load_limit}")
+            log(f"  LoadVideo: skip_first_frames={absolute_skip} frame_load_cap={load_limit}")
         return
 
     if "start_time" in inputs or "FFmpeg" in class_type:
@@ -744,7 +753,7 @@ def _sur_set_load_video_segment(
             log(f"  LoadVideoFFmpeg: start_time={start_time:.3f}s frame_load_cap={load_limit}")
         return
 
-    inputs["skip_first_frames"] = int(load_skip)
+    inputs["skip_first_frames"] = int(base_skip_frames) + int(load_skip)
     if log:
         log("  ⚠ LoadVideo 未声明 skip_first_frames/start_time，已尝试写入 skip_first_frames")
 
@@ -760,6 +769,7 @@ def _sur_set_segment_audio(
     audio_mode: str,
     audio_filename: str | None,
     base_start_time: float = 0.0,
+    base_skip_frames: int = 0,
     log=None,
 ):
     if not combine_nid or combine_nid not in wf:
@@ -778,7 +788,10 @@ def _sur_set_segment_audio(
             log("  音频: 未找到源文件名，回退到 LoadVideo 音频输出")
         return
     audio_id = f"sur_audio_{seg_num}"
-    start_time = max(0.0, float(base_start_time) + saved_start / frame_rate) if frame_rate > 0 else float(base_start_time)
+    start_time = (
+        max(0.0, float(base_start_time) + (int(base_skip_frames) + saved_start) / frame_rate)
+        if frame_rate > 0 else float(base_start_time)
+    )
     duration = max(0.0, saved_frames / frame_rate) if frame_rate > 0 and saved_frames > 0 else 0.0
     wf[audio_id] = {
         "class_type": "VHS_LoadAudioUpload",
@@ -2384,6 +2397,7 @@ class SegmentUpscaleRunner:
         job_key     = str(uid or "global")
         audio_filename = _sur_find_audio_filename(base_prompt, load_nid)
         base_start_time = _sur_base_video_start_time(base_prompt, load_nid)
+        base_skip_frames = _sur_base_video_skip_frames(base_prompt, load_nid)
         ref_images_list = [
             x.strip()
             for x in segment_reference_images.split(",")
@@ -2454,7 +2468,9 @@ class SegmentUpscaleRunner:
                     # 1. 修改 VHS_LoadVideo / VHS_LoadVideoFFmpeg
                     _sur_set_load_video_segment(
                         wf, load_nid, load_skip, load_limit, frame_rate,
-                        base_start_time=base_start_time, log=log
+                        base_start_time=base_start_time,
+                        base_skip_frames=base_skip_frames,
+                        log=log
                     )
 
                     # 2. 修改 SegmentFrameTrimmer（写入 VFI 后的输出裁剪帧数）
@@ -2476,7 +2492,9 @@ class SegmentUpscaleRunner:
                     _sur_set_segment_audio(
                         wf, combine_nid, load_nid, seg_num, saved_start, saved_n,
                         frame_rate, audio_mode, audio_filename,
-                        base_start_time=base_start_time, log=log
+                        base_start_time=base_start_time,
+                        base_skip_frames=base_skip_frames,
+                        log=log
                     )
 
                     # 5. 删除本节点自身，避免递归触发
