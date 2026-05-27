@@ -339,6 +339,15 @@ def _sur_get_host(force_refresh=False) -> str:
     return _SUR_HOST_CACHE
 
 
+def _sur_current_client_id() -> str:
+    try:
+        srv = getattr(getattr(server, "PromptServer", None), "instance", None)
+        cid = getattr(srv, "client_id", None) if srv is not None else None
+        return str(cid or "")
+    except Exception:
+        return ""
+
+
 # ── ComfyUI API 操作 ──────────────────────────────────────────────
 
 def _queue_prompt(workflow: dict, client_id: str = "") -> str:
@@ -784,6 +793,80 @@ def _sur_set_segment_audio(
         log(f"  音频: start={start_time:.3f}s duration={duration:.3f}s")
 
 
+def _sur_bool(value, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    if isinstance(value, (int, float)):
+        return bool(value)
+    text = str(value).strip().lower()
+    if text in ("1", "true", "yes", "on", "开", "是"):
+        return True
+    if text in ("0", "false", "no", "off", "关", "否", ""):
+        return False
+    return default
+
+
+def _sur_repair_legacy_widget_shift(
+    clear_segment_history,
+    unload_models_between_segments,
+    merge_segments,
+    merged_filename_prefix,
+    enable_checkpoint,
+    auto_resume_checkpoint,
+    clear_checkpoint_on_finish,
+    pre_segment_paths,
+    reference_image_node_id,
+    segment_reference_images,
+    audio_mode,
+):
+    shifted = (
+        isinstance(unload_models_between_segments, str)
+        and not isinstance(merged_filename_prefix, str)
+    )
+    if not shifted:
+        return (
+            clear_segment_history,
+            unload_models_between_segments,
+            merge_segments,
+            merged_filename_prefix,
+            enable_checkpoint,
+            auto_resume_checkpoint,
+            clear_checkpoint_on_finish,
+            pre_segment_paths,
+            reference_image_node_id,
+            segment_reference_images,
+            audio_mode,
+            False,
+        )
+
+    old_merge_segments = clear_segment_history
+    old_merged_filename_prefix = unload_models_between_segments
+    old_enable_checkpoint = merge_segments
+    old_auto_resume_checkpoint = merged_filename_prefix
+    old_clear_checkpoint_on_finish = enable_checkpoint
+    old_pre_segment_paths = auto_resume_checkpoint
+    old_reference_image_node_id = clear_checkpoint_on_finish
+    old_segment_reference_images = pre_segment_paths
+    old_audio_mode = reference_image_node_id
+
+    return (
+        True,
+        False,
+        old_merge_segments,
+        old_merged_filename_prefix,
+        old_enable_checkpoint,
+        old_auto_resume_checkpoint,
+        old_clear_checkpoint_on_finish,
+        old_pre_segment_paths,
+        old_reference_image_node_id,
+        old_segment_reference_images,
+        old_audio_mode or audio_mode,
+        True,
+    )
+
+
 def _sur_set_segment_reference_image(
     wf: dict,
     ref_node_id: str,
@@ -813,9 +896,22 @@ def _sur_merge_videos(video_paths: list[str], output_path: str, log=None) -> boo
         with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False, encoding="utf-8") as f:
             list_path = f.name
             for p in video_paths:
-                f.write("file " + repr(p) + "\n")
-        cmd = ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", list_path, "-c", "copy", output_path]
+                safe_path = os.path.realpath(str(p)).replace("\\", "/").replace("'", "'\\''")
+                f.write(f"file '{safe_path}'\n")
+        ffmpeg = shutil.which("ffmpeg") or "ffmpeg"
+        cmd = [ffmpeg, "-y", "-f", "concat", "-safe", "0", "-i", list_path, "-c", "copy", output_path]
         result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode == 0:
+            return True
+        if log:
+            log(f"  ffmpeg copy 合并失败，尝试重新编码合并: {result.stderr[-300:]}")
+        fallback = [
+            ffmpeg, "-y", "-f", "concat", "-safe", "0", "-i", list_path,
+            "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
+            "-c:a", "aac", "-b:a", "192k",
+            output_path,
+        ]
+        result = subprocess.run(fallback, capture_output=True, text=True)
         if result.returncode == 0:
             return True
         if log:
@@ -1465,6 +1561,10 @@ def _clear_comfy_execution_cache(log=None, reset_executors: bool = True):
 
 
 def _run_post_segment_clean(log, deep: bool = True, unload_models: bool = False):
+    before_ram = _sur_ram_gb()
+    before_vram = _sur_vram_gb()
+    if log:
+        log(f"  段后清理开始: RAM={before_ram:.2f}GB VRAM={before_vram:.2f}GB")
     if unload_models:
         try:
             from comfy import model_management as _mm
@@ -1475,6 +1575,13 @@ def _run_post_segment_clean(log, deep: bool = True, unload_models: bool = False)
 
     if not deep:
         _clear_comfy_execution_cache(log=log)
+        after_ram = _sur_ram_gb()
+        after_vram = _sur_vram_gb()
+        if log:
+            log(
+                f"  段后清理结束: RAM={after_ram:.2f}GB VRAM={after_vram:.2f}GB "
+                f"(ΔRAM={after_ram - before_ram:+.2f}GB ΔVRAM={after_vram - before_vram:+.2f}GB)"
+            )
         return
     try:
         cleaner = SegmentDeepRAMCleanNode()
@@ -1502,6 +1609,13 @@ def _run_post_segment_clean(log, deep: bool = True, unload_models: bool = False)
         log(f"  深度段后清理失败: {type(e).__name__}: {e}")
     finally:
         _clear_comfy_execution_cache(log=log)
+        after_ram = _sur_ram_gb()
+        after_vram = _sur_vram_gb()
+        if log:
+            log(
+                f"  段后清理结束: RAM={after_ram:.2f}GB VRAM={after_vram:.2f}GB "
+                f"(ΔRAM={after_ram - before_ram:+.2f}GB ΔVRAM={after_vram - before_vram:+.2f}GB)"
+            )
 
 
 # ── 工具函数 ──────────────────────────────────────────────────────
@@ -2031,7 +2145,7 @@ class SegmentUpscaleRunner:
                 "merge_segments": (
                     "BOOLEAN",
                     {
-                        "default": False,
+                        "default": True,
                         "tooltip": "全部完成后用 ffmpeg concat 自动合并每段视频。要求各段编码参数一致。",
                     },
                 ),
@@ -2117,7 +2231,7 @@ class SegmentUpscaleRunner:
         cleanup_node_selectors="DeepRAMCleanNode,VRAM_Debug,easy showAnything,PreviewImage,SaveImage",
         clear_segment_history=True,
         unload_models_between_segments=False,
-        merge_segments=False,
+        merge_segments=True,
         merged_filename_prefix="sur_merged",
         enable_checkpoint=True,
         auto_resume_checkpoint=True,
@@ -2138,17 +2252,43 @@ class SegmentUpscaleRunner:
         combine_nid  = (combine_video_node_id or "").strip()
         trimmer_nid  = (trimmer_node_id or "").strip()
         trim_override = max(0, int(trim_multiplier_override or 0))
-        cleanup_between_segments = bool(cleanup_between_segments)
-        deep_cleanup_between_segments = bool(deep_cleanup_between_segments)
-        prune_cleanup_debug_nodes = bool(prune_cleanup_debug_nodes)
-        clear_segment_history = bool(clear_segment_history)
-        unload_models_between_segments = bool(unload_models_between_segments)
-        merge_segments = bool(merge_segments)
+        (
+            clear_segment_history,
+            unload_models_between_segments,
+            merge_segments,
+            merged_filename_prefix,
+            enable_checkpoint,
+            auto_resume_checkpoint,
+            clear_checkpoint_on_finish,
+            pre_segment_paths,
+            reference_image_node_id,
+            segment_reference_images,
+            audio_mode,
+            legacy_widget_shift,
+        ) = _sur_repair_legacy_widget_shift(
+            clear_segment_history,
+            unload_models_between_segments,
+            merge_segments,
+            merged_filename_prefix,
+            enable_checkpoint,
+            auto_resume_checkpoint,
+            clear_checkpoint_on_finish,
+            pre_segment_paths,
+            reference_image_node_id,
+            segment_reference_images,
+            audio_mode,
+        )
+        cleanup_between_segments = _sur_bool(cleanup_between_segments, True)
+        deep_cleanup_between_segments = _sur_bool(deep_cleanup_between_segments, True)
+        prune_cleanup_debug_nodes = _sur_bool(prune_cleanup_debug_nodes, True)
+        clear_segment_history = _sur_bool(clear_segment_history, True)
+        unload_models_between_segments = _sur_bool(unload_models_between_segments, False)
+        merge_segments = _sur_bool(merge_segments, True)
         cleanup_selectors = _parse_selectors(cleanup_node_selectors)
-        merged_filename_prefix = (merged_filename_prefix or "sur_merged").strip() or "sur_merged"
-        enable_checkpoint = bool(enable_checkpoint)
-        auto_resume_checkpoint = bool(auto_resume_checkpoint)
-        clear_checkpoint_on_finish = bool(clear_checkpoint_on_finish)
+        merged_filename_prefix = str(merged_filename_prefix or "sur_merged").strip() or "sur_merged"
+        enable_checkpoint = _sur_bool(enable_checkpoint, True)
+        auto_resume_checkpoint = _sur_bool(auto_resume_checkpoint, True)
+        clear_checkpoint_on_finish = _sur_bool(clear_checkpoint_on_finish, True)
         pre_segment_paths = str(pre_segment_paths or "").strip()
         reference_image_node_id = str(reference_image_node_id or "").strip()
         segment_reference_images = str(segment_reference_images or "").strip()
@@ -2160,7 +2300,7 @@ class SegmentUpscaleRunner:
 
         extra_info = extra_pnginfo if isinstance(extra_pnginfo, dict) else {}
         full_prompt = extra_info.get("sur_full_prompt") or prompt
-        client_id   = str(extra_info.get("sur_client_id") or "")
+        client_id   = str(extra_info.get("sur_client_id") or _sur_current_client_id() or "")
         load_nid = _sur_auto_node_id(full_prompt, load_nid, ("VHS_LoadVideo", "VHS_LoadVideoFFmpeg"), "load_video_node_id", log=log)
         combine_nid = _sur_auto_node_id(full_prompt, combine_nid, "VHS_VideoCombine", "combine_video_node_id", log=log)
         trimmer_nid = _sur_auto_node_id(full_prompt, trimmer_nid, "SegmentFrameTrimmer", "trimmer_node_id", log=log)
@@ -2269,6 +2409,9 @@ class SegmentUpscaleRunner:
                     log(f"音频模式: {audio_mode}" + (f"  源: {audio_filename}" if audio_filename else ""))
                 if trimmer_nid:
                     log(f"Trimmer 输出裁剪倍率=x{trim_multiplier}  来源: {trim_note}")
+                if legacy_widget_shift:
+                    log("检测到旧版工作流 widgets_values 顺序，已按旧参数自动兼容")
+                log("前端执行状态转发=" + ("开" if client_id else "关（未取得 client_id）"))
                 log(
                     "段间清理="
                     + ("开" if cleanup_between_segments else "关")
@@ -2276,6 +2419,7 @@ class SegmentUpscaleRunner:
                     + ("  模型卸载=开" if cleanup_between_segments and unload_models_between_segments else "")
                     + f"  history清理={'开' if clear_segment_history else '关'}"
                     + f"  图内清理分支裁剪={'开' if prune_cleanup_debug_nodes else '关'}"
+                    + f"  自动合并={'开' if merge_segments else '关'}"
                 )
 
                 segment_output_paths: list[str] = list(pre_paths)

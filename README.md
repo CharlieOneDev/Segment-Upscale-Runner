@@ -54,6 +54,8 @@ VHS_LoadVideo
 
 如果使用 `VHS_LoadVideoFFmpeg`，Runner 会自动把 `load_skip` 换算成 `start_time = 原始 start_time + load_skip / frame_rate`，并写入 `frame_load_cap`。如果节点 ID 填错或填到了错误类型的节点，但图里只有一个对应节点，Runner 会自动纠正并在日志里提示。
 
+新版 Runner 会把每段子任务提交给当前浏览器客户端，ComfyUI 前端应能继续显示子任务正在执行的节点；日志中也会显示 `前端执行状态转发=开/关`。段后清理会优先调用本插件内置的 `SegmentDeepRAMCleanNode`，并输出清理前后的 RAM/VRAM。`merge_segments` 新建节点默认开启，旧工作流如果关闭过该开关仍会按旧配置执行。
+
 ## 裁剪与插帧
 
 - `trim_multiplier_override=0`：自动识别 Trimmer 上游的 RIFE/VFI 倍率。
