@@ -52,6 +52,8 @@ VHS_LoadVideo
 - `combine_video_node_id`：`VHS_VideoCombine` 节点 ID。
 - `trimmer_node_id`：`SegmentFrameTrimmer` 节点 ID。
 
+如果使用 `VHS_LoadVideoFFmpeg`，Runner 会自动把 `load_skip` 换算成 `start_time = 原始 start_time + load_skip / frame_rate`，并写入 `frame_load_cap`。如果节点 ID 填错或填到了错误类型的节点，但图里只有一个对应节点，Runner 会自动纠正并在日志里提示。
+
 ## 裁剪与插帧
 
 - `trim_multiplier_override=0`：自动识别 Trimmer 上游的 RIFE/VFI 倍率。
