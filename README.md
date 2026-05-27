@@ -1,6 +1,6 @@
 # Segment Upscale Runner
 
-通用视频分段加工队列节点。它借鉴 `Comfyui-Segment-Queue-Runner` 的逐段 prompt 队列、断点保护、成果物记录和合并思路，但不绑定 `WanVideoAnimateEmbeds`。你可以把一个大视频分成多段，每段进入任意自定义工作流，例如高清放大、插帧、去噪、调色、补帧，最后再把成果物拼接起来。
+通用视频分段加工队列节点。它把一个大视频拆成多个连续片段，逐段提交到任意自定义 ComfyUI 工作流，例如高清放大、插帧、去噪、调色、补帧，最后可选把所有成果物拼接成一个视频。
 
 ## 核心能力
 
@@ -9,14 +9,26 @@
 - 重叠帧上下文：后一段可多读前一段尾部帧。
 - `SegmentFrameTrimmer` 自动裁掉重叠输出。
 - 自动识别 `RIFE VFI` 等插帧倍率。例如 `overlap_frames=8`、`multiplier=2` 时写入 `trim_out=15`。
-- 段间清理：清 ComfyUI 执行缓存、CUDA 缓存、Python GC，并可调用 `malloc_trim_node.py` 深度清理。
-- 自动移除子 prompt 里的清理/调试/预览分支，避免它们持有大 IMAGE tensor。
+- 段间清理：内置深度 RAM 清理、ComfyUI 执行缓存清理、CUDA 缓存清理和 Python GC，不再依赖外部 `malloc_trim_node.py`。
+- 可删除每段子 prompt 的 history，减少长任务历史记录积压。
+- 自动移除子 prompt 里的清理、调试、预览、保存图片分支，避免它们持有大 IMAGE tensor。
+- `Segment Run Log Viewer` 可在 ComfyUI 画布里显示 Runner 日志，适合云平台看不到终端的场景。
 - checkpoint 自动记录与自动续跑。
 - 已完成前段视频可加入合并列表。
 - 参考图可按段替换。
 - 音频可保持原样、按段从源视频切片，或禁用。
 - 可选 ffmpeg 自动合并所有分段视频。
 - 提供轻量后端接口：checkpoint 查询/清除、图片/视频列表、图片/视频上传。
+
+## 界面语言
+
+本插件提供 ComfyUI 原生 `locales` 翻译文件：
+
+- `en`：English
+- `zh` / `zh-CN`：中文
+- `ja` / `ja-JP`：日本語
+
+重启 ComfyUI 后，节点标题、参数名和 tooltip 会跟随 ComfyUI 当前语言显示。若你的前端或翻译插件只识别其中一种语言代码，两个常见代码都已内置。
 
 ## 推荐接线
 
@@ -53,6 +65,8 @@ trim_out = (overlap_frames - 1) * multiplier + 1
 
 例如 `overlap_frames=8`、`multiplier=2`，后续段会裁掉 `15` 个输出帧。
 
+`SegmentFrameTrimmer.clone_output` 默认关闭。只有当你确认裁剪后的 PyTorch 切片视图仍然导致原始大张量被长期引用时再打开；它会复制裁剪结果，释放引用更彻底，但保存前会临时增加 RAM 占用。
+
 ## 段间清理
 
 推荐保持默认：
@@ -61,10 +75,31 @@ trim_out = (overlap_frames - 1) * multiplier + 1
 cleanup_between_segments      = true
 deep_cleanup_between_segments = true
 prune_cleanup_debug_nodes     = true
-cleanup_node_selectors        = DeepRAMCleanNode,VRAM_Debug,easy showAnything
+clear_segment_history         = true
+unload_models_between_segments = false
+cleanup_node_selectors        = DeepRAMCleanNode,VRAM_Debug,easy showAnything,PreviewImage,SaveImage
 ```
 
-如果你的工作流里还有纯预览或调试节点，可以把 class type 或节点 ID 加进 `cleanup_node_selectors`。
+说明：
+
+- `deep_cleanup_between_segments` 会在每段 prompt 完成后调用插件内置的 `SegmentDeepRAMCleanNode` 清理内核。
+- 清理顺序是先深度清理，再重置 ComfyUI executor cache。这样深度清理仍能看到 cache 中的大 tensor 并尝试释放底层 storage。
+- `clear_segment_history` 会在拿到输出视频路径后删除该子 prompt 的 history。长任务建议开启。
+- `unload_models_between_segments` 更激进，会卸载模型，下一段会重新加载，速度会慢一些。只有持续 OOM 时再打开。
+- 如果工作流里还有纯预览、调试、临时保存节点，把它们的 class type 或节点 ID 加进 `cleanup_node_selectors`。
+
+原来的单文件 `custom_nodes/malloc_trim_node.py` 可以不再安装。本插件同时注册了兼容类名 `DeepRAMCleanNode` 和新类名 `SegmentDeepRAMCleanNode`，方便旧工作流过渡；为避免重复类名提示，建议确认旧插件不再需要后再禁用或移走它。
+
+## 画布内日志
+
+云平台不方便看终端时，可以添加 `Segment Run Log Viewer` 节点：
+
+```text
+runner_node_id = SegmentUpscaleRunner 的节点 ID
+max_lines      = 300
+```
+
+运行这个日志节点后，它会在节点 UI 里显示最近日志，并输出一份 `STRING`。`runner_node_id` 留空会显示当前内存中所有 Runner 日志。若只想清理某个 Runner 的日志，填入 ID 后开启 `clear_after_read` 再运行一次。
 
 ## Checkpoint 与续跑
 
@@ -135,7 +170,3 @@ trim_in=8  trim_out=15
 
 4. `execute=true` 运行。Runner 会中断当前 prompt，然后后台逐段提交真正的子 prompt。
 5. 中断后再次运行，默认会自动从 checkpoint 续跑。
-
-## 与 Segment Queue Runner 的关系
-
-Queue Runner 原本偏向 WanVideo 动作迁移，会给 `WanVideoAnimateEmbeds` 接 transition video。本插件不做这类专用接线，而是保留更通用的能力：分段、清理、断点、参考图、音频、成果物记录、拼接。你的加工链路可以是 FlashVSR、RIFE、VHS、KJNodes 或其他任意 IMAGE→IMAGE/video 流程。

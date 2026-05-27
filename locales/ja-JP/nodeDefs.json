@@ -1,0 +1,165 @@
+{
+  "SegmentUpscaleRunner": {
+    "display_name": "セグメント処理キュー",
+    "description": "長い動画を複数のセグメントに分け、各セグメントを任意の処理ワークフローで順番に実行し、必要に応じて出力を結合します。",
+    "inputs": {
+      "total_frames": {
+        "name": "総フレーム数",
+        "tooltip": "動画の総フレーム数です。VHS_LoadVideo の frame_count 出力に接続してください。"
+      },
+      "frame_rate": {
+        "name": "フレームレート",
+        "tooltip": "動画のフレームレートです。VHS_LoadVideo の fps 出力に接続してください。"
+      },
+      "segment_count": {
+        "name": "分割数",
+        "tooltip": "動画をいくつのセグメントに分けるかを指定します。"
+      },
+      "start_segment": {
+        "name": "開始セグメント",
+        "tooltip": "何番目のセグメントから開始するかを指定します。手動再開時に使います。"
+      },
+      "overlap_frames": {
+        "name": "オーバーラップフレーム",
+        "tooltip": "前セグメント末尾から再利用する入力コンテキストフレーム数です。生成後の重複部分は SegmentFrameTrimmer で削除されます。"
+      },
+      "execute": {
+        "name": "実行",
+        "tooltip": "オフ = 分割計画のみプレビュー。オン = セグメントキューを実行します。"
+      },
+      "load_video_node_id": {
+        "name": "動画読み込みノード ID",
+        "tooltip": "VHS_LoadVideo のノード ID。"
+      },
+      "combine_video_node_id": {
+        "name": "動画結合ノード ID",
+        "tooltip": "VHS_VideoCombine のノード ID。"
+      },
+      "trimmer_node_id": {
+        "name": "トリマーノード ID",
+        "tooltip": "SegmentFrameTrimmer のノード ID。overlap_frames が 0 より大きい場合は必須です。"
+      },
+      "trim_multiplier_override": {
+        "name": "トリム倍率上書き",
+        "tooltip": "0 = Trimmer 上流の RIFE/VFI 倍率を自動検出。失敗する場合は 2、4 などを手動指定します。"
+      },
+      "cleanup_between_segments": {
+        "name": "セグメント間クリーンアップ",
+        "tooltip": "各セグメント完了後に ComfyUI 実行キャッシュ、CUDA キャッシュ、Python GC を実行します。"
+      },
+      "deep_cleanup_between_segments": {
+        "name": "ディープクリーンアップ",
+        "tooltip": "各セグメント完了後に内蔵の SegmentDeepRAMCleanNode クリーンアップコアを呼び出します。"
+      },
+      "prune_cleanup_debug_nodes": {
+        "name": "デバッグ分岐を削除",
+        "tooltip": "各子 prompt からクリーンアップ、デバッグ、プレビュー、一時保存分岐を削除します。"
+      },
+      "cleanup_node_selectors": {
+        "name": "削除ノード指定",
+        "tooltip": "子 prompt から削除するノード ID または class type をカンマ区切りで指定します。"
+      },
+      "clear_segment_history": {
+        "name": "セグメント履歴を削除",
+        "tooltip": "出力パスを記録した後、完了した子 prompt の history を削除して長時間タスクのメモリ蓄積を減らします。"
+      },
+      "unload_models_between_segments": {
+        "name": "セグメント間でモデルをアンロード",
+        "tooltip": "より強い解放です。メモリを多く解放できますが、次のセグメントでモデルを再読み込みします。"
+      },
+      "merge_segments": {
+        "name": "セグメントを結合",
+        "tooltip": "完了後に ffmpeg concat で全セグメント動画を結合します。"
+      },
+      "merged_filename_prefix": {
+        "name": "結合ファイル名プレフィックス",
+        "tooltip": "結合動画のファイル名プレフィックス。"
+      },
+      "enable_checkpoint": {
+        "name": "checkpoint を有効化",
+        "tooltip": "各セグメント成功後に checkpoint を書き込みます。"
+      },
+      "auto_resume_checkpoint": {
+        "name": "checkpoint 自動再開",
+        "tooltip": "checkpoint がある場合、next_seg から自動再開します。"
+      },
+      "clear_checkpoint_on_finish": {
+        "name": "完了後 checkpoint を削除",
+        "tooltip": "すべてのセグメント完了後に checkpoint を自動削除します。"
+      },
+      "pre_segment_paths": {
+        "name": "前置セグメントパス",
+        "tooltip": "既に完了しているセグメント動画パスをカンマ区切りで指定します。結合時に新しい出力の前に置かれます。"
+      },
+      "reference_image_node_id": {
+        "name": "参照画像ノード ID",
+        "tooltip": "任意。セグメントごとに LoadImage などの画像ノードを差し替える場合に指定します。"
+      },
+      "segment_reference_images": {
+        "name": "セグメント参照画像",
+        "tooltip": "任意。セグメントごとの参照画像パスまたはファイル名をカンマ区切りで指定します。不足分は最後の画像を再利用します。"
+      },
+      "audio_mode": {
+        "name": "音声モード",
+        "tooltip": "keep_original = 現在の音声接続を維持；segment_from_loadvideo = 元動画からセグメントごとに音声を切り出す；disable_audio = 音声を削除。"
+      }
+    }
+  },
+  "SegmentFrameTrimmer": {
+    "display_name": "セグメントフレームトリマー",
+    "description": "保存前にセグメント先頭の重複フレームを削除します。",
+    "inputs": {
+      "images": {
+        "name": "画像シーケンス"
+      },
+      "trim_frames": {
+        "name": "削除フレーム数",
+        "tooltip": "先頭から削除するフレーム数です。SegmentUpscaleRunner が自動設定します。"
+      },
+      "clone_output": {
+        "name": "出力をコピー",
+        "tooltip": "上級者向け。トリム結果をコピーして元の大きな tensor 参照を切りますが、一時的な RAM 使用量が増えます。"
+      }
+    }
+  },
+  "SegmentRunLogViewer": {
+    "display_name": "セグメント実行ログビューア",
+    "description": "ComfyUI キャンバス内で Segment Upscale Runner のログを表示します。",
+    "inputs": {
+      "runner_node_id": {
+        "name": "Runner ノード ID",
+        "tooltip": "SegmentUpscaleRunner のノード ID。空欄の場合はメモリ内の全 Runner ログを表示します。"
+      },
+      "max_lines": {
+        "name": "最大行数",
+        "tooltip": "表示するログ行数の上限。"
+      },
+      "clear_after_read": {
+        "name": "読み取り後にクリア",
+        "tooltip": "読み取り後にこの Runner のログを削除します。runner_node_id が空欄の場合、全ログ削除は行いません。"
+      }
+    }
+  },
+  "SegmentDeepRAMCleanNode": {
+    "display_name": "セグメント Deep RAM クリーナー",
+    "description": "Segment Upscale Runner 内蔵の RAM 詳細診断とクリーンアップノードです。",
+    "inputs": {
+      "wait_ffmpeg_subprocess": {"name": "ffmpeg を待機"},
+      "clear_executor_cache": {"name": "実行キャッシュをクリア"},
+      "clear_cell_refs": {"name": "cell 参照をクリア"},
+      "clear_model_cpu_cache": {"name": "モデル CPU キャッシュをクリア"},
+      "os_trim": {"name": "OS メモリ解放"},
+      "forensic_tensor_refs": {"name": "tensor 参照診断"},
+      "forensic_executor": {"name": "executor 診断"},
+      "forensic_models": {"name": "モデル診断"},
+      "forensic_subprocess": {"name": "子プロセス診断"},
+      "forensic_threads": {"name": "スレッド診断"},
+      "forensic_gc_garbage": {"name": "GC ガベージ診断"},
+      "any_input": {"name": "任意入力"}
+    }
+  },
+  "DeepRAMCleanNode": {
+    "display_name": "セグメント Deep RAM クリーナー",
+    "description": "内蔵 Segment Deep RAM Cleaner の互換エイリアスです。"
+  }
+}

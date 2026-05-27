@@ -1,0 +1,165 @@
+{
+  "SegmentUpscaleRunner": {
+    "display_name": "Segment Upscale Runner",
+    "description": "Split a long video into queued segments, run any custom processing chain per segment, and optionally merge the outputs.",
+    "inputs": {
+      "total_frames": {
+        "name": "Total Frames",
+        "tooltip": "Total video frame count. Connect this to the frame_count output of VHS_LoadVideo."
+      },
+      "frame_rate": {
+        "name": "Frame Rate",
+        "tooltip": "Video frame rate. Connect this to the fps output of VHS_LoadVideo."
+      },
+      "segment_count": {
+        "name": "Segment Count",
+        "tooltip": "How many segments to split the video into."
+      },
+      "start_segment": {
+        "name": "Start Segment",
+        "tooltip": "Segment number to start from. Use this for manual resume."
+      },
+      "overlap_frames": {
+        "name": "Overlap Frames",
+        "tooltip": "Input context frames reused from the previous segment. Later segments will trim the generated overlap with SegmentFrameTrimmer."
+      },
+      "execute": {
+        "name": "Execute",
+        "tooltip": "Off = preview the segment plan only. On = start the queued segment run."
+      },
+      "load_video_node_id": {
+        "name": "Load Video Node ID",
+        "tooltip": "Node ID of VHS_LoadVideo."
+      },
+      "combine_video_node_id": {
+        "name": "Video Combine Node ID",
+        "tooltip": "Node ID of VHS_VideoCombine."
+      },
+      "trimmer_node_id": {
+        "name": "Trimmer Node ID",
+        "tooltip": "Node ID of SegmentFrameTrimmer. Required when overlap_frames is greater than 0."
+      },
+      "trim_multiplier_override": {
+        "name": "Trim Multiplier Override",
+        "tooltip": "0 = auto-detect RIFE/VFI multiplier upstream of the trimmer. Set 2, 4, etc. if auto detection fails."
+      },
+      "cleanup_between_segments": {
+        "name": "Cleanup Between Segments",
+        "tooltip": "Clear ComfyUI execution cache, CUDA cache, and Python GC after each segment."
+      },
+      "deep_cleanup_between_segments": {
+        "name": "Deep Cleanup",
+        "tooltip": "Call the built-in SegmentDeepRAMCleanNode cleanup core after each segment."
+      },
+      "prune_cleanup_debug_nodes": {
+        "name": "Prune Debug Branches",
+        "tooltip": "Remove cleanup, debug, preview, and temporary save branches from each child prompt."
+      },
+      "cleanup_node_selectors": {
+        "name": "Cleanup Node Selectors",
+        "tooltip": "Comma-separated node IDs or class types to remove from child prompts."
+      },
+      "clear_segment_history": {
+        "name": "Clear Segment History",
+        "tooltip": "Delete each completed child prompt from ComfyUI history after recording its output path."
+      },
+      "unload_models_between_segments": {
+        "name": "Unload Models Between Segments",
+        "tooltip": "More aggressive cleanup. Frees more memory, but the next segment must reload models."
+      },
+      "merge_segments": {
+        "name": "Merge Segments",
+        "tooltip": "Use ffmpeg concat to merge all segment videos when the run finishes."
+      },
+      "merged_filename_prefix": {
+        "name": "Merged Filename Prefix",
+        "tooltip": "Filename prefix for the merged video."
+      },
+      "enable_checkpoint": {
+        "name": "Enable Checkpoint",
+        "tooltip": "Write a checkpoint after each successful segment."
+      },
+      "auto_resume_checkpoint": {
+        "name": "Auto Resume Checkpoint",
+        "tooltip": "Resume from checkpoint next_seg when a checkpoint exists."
+      },
+      "clear_checkpoint_on_finish": {
+        "name": "Clear Checkpoint On Finish",
+        "tooltip": "Delete the checkpoint automatically after all segments finish."
+      },
+      "pre_segment_paths": {
+        "name": "Pre-Segment Paths",
+        "tooltip": "Comma-separated paths to already finished segment videos. They will be placed before new outputs when merging."
+      },
+      "reference_image_node_id": {
+        "name": "Reference Image Node ID",
+        "tooltip": "Optional. Node ID of a LoadImage-like node to replace per segment."
+      },
+      "segment_reference_images": {
+        "name": "Segment Reference Images",
+        "tooltip": "Optional comma-separated image paths or filenames. If fewer than segments, the last image is reused."
+      },
+      "audio_mode": {
+        "name": "Audio Mode",
+        "tooltip": "keep_original = keep current audio wiring; segment_from_loadvideo = cut audio from source video per segment; disable_audio = remove audio."
+      }
+    }
+  },
+  "SegmentFrameTrimmer": {
+    "display_name": "Segment Frame Trimmer",
+    "description": "Trim overlap frames from the beginning of a segment before saving.",
+    "inputs": {
+      "images": {
+        "name": "Images"
+      },
+      "trim_frames": {
+        "name": "Trim Frames",
+        "tooltip": "Number of frames to trim from the beginning. SegmentUpscaleRunner writes this automatically."
+      },
+      "clone_output": {
+        "name": "Clone Output",
+        "tooltip": "Advanced. Clone the trimmed result to detach from the original large tensor. Uses more temporary RAM."
+      }
+    }
+  },
+  "SegmentRunLogViewer": {
+    "display_name": "Segment Run Log Viewer",
+    "description": "Show Segment Upscale Runner logs inside the ComfyUI canvas.",
+    "inputs": {
+      "runner_node_id": {
+        "name": "Runner Node ID",
+        "tooltip": "Node ID of SegmentUpscaleRunner. Leave empty to show all in-memory runner logs."
+      },
+      "max_lines": {
+        "name": "Max Lines",
+        "tooltip": "Maximum number of log lines to display."
+      },
+      "clear_after_read": {
+        "name": "Clear After Read",
+        "tooltip": "Clear this runner log after reading. Empty runner_node_id will not clear all logs."
+      }
+    }
+  },
+  "SegmentDeepRAMCleanNode": {
+    "display_name": "Segment Deep RAM Cleaner",
+    "description": "Built-in deep RAM forensic and cleanup node for Segment Upscale Runner.",
+    "inputs": {
+      "wait_ffmpeg_subprocess": {"name": "Wait For ffmpeg"},
+      "clear_executor_cache": {"name": "Clear Executor Cache"},
+      "clear_cell_refs": {"name": "Clear Cell References"},
+      "clear_model_cpu_cache": {"name": "Clear Model CPU Cache"},
+      "os_trim": {"name": "OS Trim"},
+      "forensic_tensor_refs": {"name": "Forensic Tensor References"},
+      "forensic_executor": {"name": "Forensic Executor"},
+      "forensic_models": {"name": "Forensic Models"},
+      "forensic_subprocess": {"name": "Forensic Subprocesses"},
+      "forensic_threads": {"name": "Forensic Threads"},
+      "forensic_gc_garbage": {"name": "Forensic GC Garbage"},
+      "any_input": {"name": "Any Input"}
+    }
+  },
+  "DeepRAMCleanNode": {
+    "display_name": "Segment Deep RAM Cleaner",
+    "description": "Compatibility alias for the built-in Segment Deep RAM Cleaner."
+  }
+}

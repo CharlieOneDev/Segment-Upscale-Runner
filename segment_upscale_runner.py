@@ -1,14 +1,13 @@
 """
-ComfyUI 分段放大队列节点 (Segment Upscale Runner)
-- 专为高清放大场景设计
-- 每段独立保存为单独视频
+ComfyUI 通用视频分段加工队列节点 (Segment Upscale Runner)
+- 将大视频拆成多个连续片段，逐段提交到任意自定义 IMAGE/video 工作流
+- 每段独立保存为单独视频，可选自动合并
 - 支持断点续跑
 - 支持重叠帧（Overlap Frames）：用前一段尾部 N 帧作为下一段头部的时序上下文，
   保存时由 SegmentFrameTrimmer 节点自动裁掉，合并后无重叠、无跳帧
-- 适合 CNB 容器环境
 """
 
-import copy, gc, hashlib, json, time, os, shutil, subprocess, tempfile, threading, urllib.request, urllib.error
+import copy, ctypes, gc, hashlib, json, time, os, platform, shutil, subprocess, sys, tempfile, threading, traceback, urllib.request, urllib.error
 import server, folder_paths
 from aiohttp import web
 
@@ -32,6 +31,25 @@ def _sur_log(uid, msg):
 
 def _sur_log_clear(uid):
     _sur_log_buf.pop(str(uid), None)
+
+
+def _sur_log_text(uid: str = "", max_lines: int = 300) -> str:
+    max_lines = max(1, int(max_lines or 300))
+    uid = str(uid or "").strip()
+    if uid:
+        lines = _sur_log_buf.get(uid, [])
+        if not lines:
+            return f"[SUR] 没有找到节点 ID={uid} 的日志。"
+        return "\n".join(lines[-max_lines:])
+
+    chunks = []
+    for key in sorted(_sur_log_buf.keys()):
+        lines = _sur_log_buf.get(key, [])
+        if not lines:
+            continue
+        chunks.append(f"===== Runner Node {key} =====")
+        chunks.extend(lines[-max_lines:])
+    return "\n".join(chunks[-max_lines:]) if chunks else "[SUR] 暂无日志。"
 
 
 _SUR_PLUGIN_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -614,6 +632,41 @@ def _sur_get_output_video_info(prompt_id: str, combine_node_id: str, log=None):
     return None, None
 
 
+def _sur_delete_prompt_history(prompt_id: str, log=None) -> bool:
+    if not prompt_id:
+        return False
+    deleted = False
+    try:
+        import server as _server
+        srv = getattr(getattr(_server, "PromptServer", None), "instance", None)
+        queue = getattr(srv, "prompt_queue", None) if srv is not None else None
+        if queue is not None and hasattr(queue, "delete_history_item"):
+            queue.delete_history_item(prompt_id)
+            deleted = True
+    except Exception:
+        deleted = False
+
+    if not deleted:
+        payload = json.dumps({"delete": [prompt_id]}).encode("utf-8")
+        for host in [_sur_get_host(), _sur_get_host(force_refresh=True)]:
+            try:
+                req = urllib.request.Request(
+                    f"http://{host}/history",
+                    data=payload,
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                with urllib.request.urlopen(req, timeout=5):
+                    deleted = True
+                    break
+            except Exception:
+                continue
+
+    if deleted and log:
+        log(f"  已清理子 prompt history: {prompt_id[:8]}...")
+    return deleted
+
+
 def _sur_find_audio_filename(prompt: dict, load_nid: str) -> str | None:
     node = (prompt or {}).get(str(load_nid), {})
     video = _node_inputs(node).get("video", "")
@@ -718,10 +771,546 @@ def _sur_merge_videos(video_paths: list[str], output_path: str, log=None) -> boo
                 pass
 
 
+def _sur_import_torch():
+    try:
+        import torch
+        return torch
+    except Exception:
+        return None
+
+
+def _sur_import_psutil():
+    try:
+        import psutil
+        return psutil
+    except Exception:
+        return None
+
+
+def _sur_zero_tensor_storage(tensor) -> bool:
+    try:
+        tensor.untyped_storage().resize_(0)
+        return True
+    except Exception:
+        pass
+    try:
+        tensor.storage().resize_(0)
+        return True
+    except Exception:
+        return False
+
+
+def _sur_tensor_gb(tensor) -> float:
+    try:
+        return tensor.element_size() * tensor.nelement() / 1024**3
+    except Exception:
+        return 0.0
+
+
+def _sur_trim_ram_os() -> bool:
+    try:
+        if platform.system() == "Windows":
+            kernel32 = ctypes.windll.kernel32
+            psapi = ctypes.windll.psapi
+            handle = kernel32.GetCurrentProcess()
+            kernel32.SetProcessWorkingSetSize(handle, ctypes.c_size_t(-1), ctypes.c_size_t(-1))
+            psapi.EmptyWorkingSet(handle)
+            return True
+        if platform.system() == "Linux":
+            libc = ctypes.CDLL("libc.so.6")
+            libc.malloc_trim(0)
+            return True
+    except Exception:
+        return False
+    return False
+
+
+def _sur_process():
+    psutil = _sur_import_psutil()
+    if psutil is None:
+        return None
+    try:
+        return psutil.Process(os.getpid())
+    except Exception:
+        return None
+
+
+def _sur_ram_gb(process=None) -> float:
+    try:
+        process = process or _sur_process()
+        return process.memory_info().rss / 1024**3 if process else 0.0
+    except Exception:
+        return 0.0
+
+
+def _sur_vram_gb(torch_module=None) -> float:
+    torch = torch_module or _sur_import_torch()
+    try:
+        return torch.cuda.memory_allocated() / 1024**3 if torch and torch.cuda.is_available() else 0.0
+    except Exception:
+        return 0.0
+
+
+def _sur_get_prompt_executors() -> list[tuple[object, str]]:
+    executors: list[tuple[object, str]] = []
+
+    def add(obj, source):
+        if obj is not None and id(obj) not in {id(e) for e, _ in executors}:
+            executors.append((obj, source))
+
+    try:
+        import server as _server
+        srv = getattr(getattr(_server, "PromptServer", None), "instance", None)
+        if srv is not None:
+            for attr in ("prompt_executor", "executor"):
+                add(getattr(srv, attr, None), f"PromptServer.{attr}")
+    except Exception:
+        pass
+
+    try:
+        import execution
+        for attr in ("executor", "prompt_executor", "current_executor"):
+            add(getattr(execution, attr, None), f"execution.{attr}")
+        cls = getattr(execution, "PromptExecutor", None)
+        if cls is not None:
+            for obj in gc.get_objects():
+                try:
+                    if isinstance(obj, cls):
+                        add(obj, "gc(isinstance)")
+                except Exception:
+                    continue
+    except Exception:
+        pass
+
+    try:
+        for obj in gc.get_objects():
+            try:
+                if type(obj).__name__ == "PromptExecutor":
+                    add(obj, "gc(typename)")
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    return executors
+
+
+def _sur_deep_nullify(obj, torch, stats: dict, depth: int = 0):
+    if obj is None or torch is None or depth > 8:
+        return
+    try:
+        if isinstance(obj, torch.Tensor):
+            stats["tensor_count"] += 1
+            shape = list(obj.shape)
+            if len(stats["shapes"]) < 8:
+                stats["shapes"].append(shape)
+            _sur_zero_tensor_storage(obj)
+            return
+    except Exception:
+        return
+
+    if isinstance(obj, dict):
+        for key in list(obj.keys()):
+            try:
+                _sur_deep_nullify(obj[key], torch, stats, depth + 1)
+                obj[key] = None
+            except Exception:
+                pass
+        return
+    if isinstance(obj, list):
+        for i in range(len(obj)):
+            try:
+                _sur_deep_nullify(obj[i], torch, stats, depth + 1)
+                obj[i] = None
+            except Exception:
+                pass
+        return
+    if isinstance(obj, tuple):
+        for item in obj:
+            _sur_deep_nullify(item, torch, stats, depth + 1)
+
+
+def _sur_deep_clear_cache_obj(cache, torch, lines: list[str], label: str, stats: dict, depth: int = 0) -> int:
+    if cache is None or depth > 8:
+        return 0
+    removed = 0
+
+    pending = getattr(cache, "_pending_store_tasks", None)
+    if isinstance(pending, set):
+        for task in list(pending):
+            try:
+                task.cancel()
+            except Exception:
+                pass
+        pending.clear()
+
+    cache_dict = getattr(cache, "cache", None)
+    if isinstance(cache_dict, dict):
+        for key in list(cache_dict.keys()):
+            try:
+                _sur_deep_nullify(cache_dict[key], torch, stats, depth + 1)
+                del cache_dict[key]
+                removed += 1
+            except Exception:
+                pass
+
+    subcaches = getattr(cache, "subcaches", None)
+    if isinstance(subcaches, dict):
+        for subkey, subcache in list(subcaches.items()):
+            removed += _sur_deep_clear_cache_obj(subcache, torch, lines, f"{label}.{subkey}", stats, depth + 1)
+        try:
+            subcaches.clear()
+        except Exception:
+            pass
+
+    for attr in ("children", "used_generation", "timestamps"):
+        val = getattr(cache, attr, None)
+        if hasattr(val, "clear"):
+            try:
+                val.clear()
+            except Exception:
+                pass
+
+    if removed:
+        lines.append(f"  清理 {label}: {removed} 个 cache entry")
+    return removed
+
+
+def _sur_deep_clear_executor(executor, source: str, torch, lines: list[str]) -> int:
+    stats = {"tensor_count": 0, "shapes": []}
+    outputs = getattr(executor, "outputs", {})
+    n_nodes = len(outputs) if hasattr(outputs, "__len__") else 0
+
+    if isinstance(outputs, dict):
+        for node_id in list(outputs.keys()):
+            try:
+                _sur_deep_nullify(outputs[node_id], torch, stats)
+            except Exception:
+                pass
+        try:
+            outputs.clear()
+        except Exception:
+            pass
+
+    for attr in ("outputs_ui", "old_prompt", "node_store", "_cache"):
+        obj = getattr(executor, attr, None)
+        if hasattr(obj, "clear"):
+            try:
+                obj.clear()
+            except Exception:
+                pass
+
+    caches = getattr(executor, "caches", None)
+    if caches is not None:
+        seen = set()
+        for name in ("outputs", "objects"):
+            cache = getattr(caches, name, None)
+            if cache is not None and id(cache) not in seen:
+                seen.add(id(cache))
+                _sur_deep_clear_cache_obj(cache, torch, lines, f"{source}.caches.{name}", stats)
+        for cache in getattr(caches, "all", []) or []:
+            if cache is not None and id(cache) not in seen:
+                seen.add(id(cache))
+                _sur_deep_clear_cache_obj(cache, torch, lines, f"{source}.caches.{type(cache).__name__}", stats)
+
+    lines.append(
+        f"  {source}: 清空 {n_nodes} 节点, "
+        f"{stats['tensor_count']} 个 tensor 已 resize_(0), shapes={stats['shapes']}"
+    )
+    return stats["tensor_count"]
+
+
+def _sur_wait_for_ffmpeg_subprocesses(lines: list[str], timeout: int = 120) -> bool:
+    psutil = _sur_import_psutil()
+    if psutil is None:
+        lines.append("  ffmpeg子进程: psutil 不可用，跳过等待")
+        return False
+    try:
+        proc = psutil.Process(os.getpid())
+        ffmpeg_procs = []
+        for child in proc.children(recursive=True):
+            try:
+                name = child.name().lower()
+                cmdline = " ".join(child.cmdline()).lower()
+                if "ffmpeg" in name or "ffmpeg" in cmdline:
+                    ffmpeg_procs.append(child)
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass
+        if not ffmpeg_procs:
+            lines.append("  ffmpeg子进程: 无（已完成或未启动）✓")
+            return True
+        lines.append(f"  ffmpeg子进程: 发现 {len(ffmpeg_procs)} 个，等待完成（超时{timeout}s）...")
+        deadline = time.time() + timeout
+        for proc in ffmpeg_procs:
+            try:
+                remaining = max(0, deadline - time.time())
+                lines.append(f"    等待 PID {proc.pid}  {' '.join(proc.cmdline()[:6])[:80]}")
+                proc.wait(timeout=remaining)
+                lines.append(f"    ✓ PID {proc.pid} 已完成")
+            except psutil.TimeoutExpired:
+                lines.append(f"    ⚠ PID {proc.pid} 超时，尝试终止")
+                try:
+                    proc.terminate()
+                    proc.wait(timeout=5)
+                except Exception:
+                    pass
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                lines.append(f"    ✓ PID {proc.pid} 已消失")
+        return True
+    except Exception as e:
+        lines.append(f"  ffmpeg等待异常: {e}")
+        return False
+
+
+def _sur_wait_for_vhs_threads(lines: list[str], timeout: int = 60) -> bool:
+    vhs_threads = []
+    for thread in threading.enumerate():
+        name = thread.name.lower()
+        if any(key in name for key in ("vhs", "video", "ffmpeg", "combine", "encode")):
+            vhs_threads.append(thread)
+    try:
+        for mod_name, mod in list(sys.modules.items()):
+            if "videohelpersuite" in mod_name.lower() or "vhs" in mod_name.lower():
+                for attr in ("active_threads", "thread_pool", "background_tasks", "_threads"):
+                    val = getattr(mod, attr, None)
+                    if isinstance(val, list):
+                        vhs_threads.extend([t for t in val if isinstance(t, threading.Thread)])
+                    elif isinstance(val, threading.Thread):
+                        vhs_threads.append(val)
+    except Exception:
+        pass
+
+    uniq = []
+    seen = set()
+    for thread in vhs_threads:
+        if id(thread) not in seen and thread is not threading.current_thread():
+            seen.add(id(thread))
+            uniq.append(thread)
+    if not uniq:
+        lines.append("  VHS线程: 无活跃线程（Windows子进程模式或已完成）")
+        return True
+    lines.append(f"  VHS线程: 发现 {len(uniq)} 个，等待（超时{timeout}s）...")
+    for thread in uniq:
+        thread.join(timeout=timeout)
+        lines.append(f"    {'✓' if not thread.is_alive() else '⚠超时'}: {thread.name}")
+    return all(not thread.is_alive() for thread in uniq)
+
+
+def _sur_clear_cell_tensor_refs(lines: list[str], size_threshold_gb: float = 0.05) -> int:
+    torch = _sur_import_torch()
+    if torch is None:
+        lines.append("  cell引用清理: torch 不可用，跳过")
+        return 0
+    cleared = 0
+    total_gb = 0.0
+    try:
+        for obj in gc.get_objects():
+            try:
+                if type(obj).__name__ != "cell":
+                    continue
+                try:
+                    contents = obj.cell_contents
+                except ValueError:
+                    continue
+                if isinstance(contents, torch.Tensor) and not contents.is_cuda:
+                    gb = _sur_tensor_gb(contents)
+                    if gb >= size_threshold_gb:
+                        _sur_zero_tensor_storage(contents)
+                        cleared += 1
+                        total_gb += gb
+            except Exception:
+                continue
+    except Exception:
+        pass
+    if cleared:
+        lines.append(f"  cell引用清理: {cleared} 个 cell, 合计 {total_gb:.2f}GB tensor 已释放")
+    else:
+        lines.append("  cell引用清理: 无大 tensor cell ✓")
+    return cleared
+
+
+def _sur_trace_tensor_holders(lines: list[str], size_threshold_gb: float = 0.05, max_tensors: int = 8):
+    torch = _sur_import_torch()
+    if torch is None:
+        lines.append("  === tensor 引用链追踪 ===")
+        lines.append("  torch 不可用，跳过")
+        return
+    lines.append("  === tensor 引用链追踪 ===")
+    big_tensors = []
+    try:
+        for obj in gc.get_objects():
+            try:
+                if isinstance(obj, torch.Tensor) and not obj.is_cuda:
+                    gb = _sur_tensor_gb(obj)
+                    if gb >= size_threshold_gb:
+                        big_tensors.append((gb, obj))
+            except Exception:
+                continue
+    except Exception:
+        pass
+    big_tensors.sort(key=lambda x: x[0], reverse=True)
+    lines.append(f"  共 {len(big_tensors)} 个大CPU tensor（≥{size_threshold_gb}GB）")
+    for i, (gb, tensor) in enumerate(big_tensors[:max_tensors]):
+        lines.append(f"\n  [tensor #{i + 1}] {gb:.3f}GB  shape={list(tensor.shape)}  dtype={tensor.dtype}")
+        try:
+            refs = [r for r in gc.get_referrers(tensor) if r is not big_tensors and r is not locals()]
+            lines.append(f"    直接引用者 ({len(refs)} 个):")
+            for ref in refs[:5]:
+                ref_type = type(ref).__name__
+                if ref_type == "cell":
+                    lines.append("      ★ cell（闭包变量）← 可由 cell 清理处理")
+                elif isinstance(ref, dict):
+                    keys = [k for k, v in ref.items() if v is tensor]
+                    holders = [type(h).__name__ for h in gc.get_referrers(ref)[:3] if not isinstance(h, (list, dict))]
+                    lines.append(f"      dict[key={keys}] ← 持有者: {holders}")
+                elif isinstance(ref, list):
+                    holders = [type(h).__name__ for h in gc.get_referrers(ref)[:3] if not isinstance(h, (list, dict))]
+                    lines.append(f"      list(len={len(ref)}) ← 持有者: {holders}")
+                elif ref_type == "frame":
+                    lines.append(f"      ★ frame: {ref.f_code.co_filename}:{ref.f_lineno} in {ref.f_code.co_name}()")
+                else:
+                    lines.append(f"      {ref_type}({getattr(type(ref), '__module__', '')})")
+        except Exception as e:
+            lines.append(f"    追踪失败: {e}")
+
+
+def _sur_analyze_threads(lines: list[str]):
+    lines.append("  === 线程 ===")
+    for thread in threading.enumerate():
+        tag = "[d]" if thread.daemon else "[n]"
+        lines.append(f"  {tag} {thread.name}  alive={thread.is_alive()}")
+        try:
+            frame = sys._current_frames().get(thread.ident)
+            if frame:
+                stack = traceback.extract_stack(frame)
+                if stack:
+                    last = stack[-1]
+                    lines.append(f"    @ {last.filename}:{last.lineno} {last.name}()")
+        except Exception:
+            pass
+
+
+def _sur_analyze_subprocesses(lines: list[str]):
+    lines.append("  === 子进程 ===")
+    psutil = _sur_import_psutil()
+    if psutil is None:
+        lines.append("  psutil 不可用，跳过")
+        return
+    try:
+        proc = psutil.Process(os.getpid())
+        children = proc.children(recursive=True)
+        if not children:
+            lines.append("  无子进程 ✓")
+            return
+        total = 0.0
+        for child in children:
+            try:
+                mem = child.memory_info().rss / 1024**3
+                total += mem
+                cmd = " ".join(child.cmdline()[:5])[:80] if child.cmdline() else child.name()
+                tag = " ★ffmpeg" if "ffmpeg" in cmd.lower() else ""
+                lines.append(f"  PID {child.pid}  {child.status():<8}  {mem:.2f}GB  {cmd}{tag}")
+            except Exception:
+                pass
+        lines.append(f"  合计: {len(children)} 个  {total:.2f}GB")
+    except Exception as e:
+        lines.append(f"  分析失败: {e}")
+
+
+def _sur_analyze_executor_cache(lines: list[str]):
+    lines.append("  === executor/cache 分析 ===")
+    executors = _sur_get_prompt_executors()
+    if not executors:
+        lines.append("  ✗ executor 未找到")
+        return
+    torch = _sur_import_torch()
+    for executor, source in executors:
+        outputs = getattr(executor, "outputs", {})
+        lines.append(f"  来源: {source}  outputs节点数: {len(outputs) if hasattr(outputs, '__len__') else 0}")
+        node_sizes = []
+
+        def scan(obj, depth=0):
+            if torch is None or depth > 5:
+                return []
+            if isinstance(obj, torch.Tensor):
+                return [_sur_tensor_gb(obj)]
+            if isinstance(obj, dict):
+                vals = []
+                for v in obj.values():
+                    vals.extend(scan(v, depth + 1))
+                return vals
+            if isinstance(obj, (list, tuple)):
+                vals = []
+                for v in obj:
+                    vals.extend(scan(v, depth + 1))
+                return vals
+            return []
+
+        if isinstance(outputs, dict):
+            for node_id, val in outputs.items():
+                sizes = scan(val)
+                if sizes:
+                    node_sizes.append((sum(sizes), node_id, len(sizes)))
+        if node_sizes:
+            node_sizes.sort(reverse=True)
+            lines.append(f"  outputs 含tensor节点: {len(node_sizes)} 个  合计 {sum(x[0] for x in node_sizes):.2f}GB")
+            for gb, node_id, count in node_sizes[:8]:
+                lines.append(f"    node={node_id}  {gb:.3f}GB  ({count}个tensor)")
+        else:
+            lines.append("  outputs 无大tensor或新版 cache 持有位置不在 outputs")
+
+
+def _sur_analyze_models(lines: list[str]):
+    lines.append("  === comfy model_management ===")
+    try:
+        import comfy.model_management as mm
+        loaded = getattr(mm, "current_loaded_models", [])
+        lines.append(f"  已加载模型: {len(loaded)} 个")
+        total = 0.0
+        for model in loaded:
+            try:
+                raw_model = getattr(model, "model", model)
+                name = type(raw_model).__name__
+                device = str(getattr(model, "device", "?"))
+                size = 0.0
+                if hasattr(raw_model, "parameters"):
+                    size = sum(p.element_size() * p.nelement() for p in raw_model.parameters()) / 1024**3
+                total += size
+                cpu_tag = " ⚠CPU-offload" if device.startswith("cpu") else ""
+                lines.append(f"  {name}  {device}  {size:.2f}GB{cpu_tag}")
+            except Exception:
+                pass
+        lines.append(f"  合计: {total:.2f}GB")
+    except Exception as e:
+        lines.append(f"  读取失败: {e}")
+
+
+def _sur_check_gc_garbage(lines: list[str]):
+    lines.append("  === gc.garbage ===")
+    gc.collect()
+    if not gc.garbage:
+        lines.append("  gc.garbage: 空 ✓")
+        return
+    counts = {}
+    for obj in gc.garbage:
+        counts[type(obj).__name__] = counts.get(type(obj).__name__, 0) + 1
+    lines.append(f"  ⚠ {len(gc.garbage)} 个对象")
+    for name, count in sorted(counts.items(), key=lambda x: -x[1])[:5]:
+        lines.append(f"    {name}: {count}")
+
+
 def _clear_cache_obj(cache, lines: list[str], label: str, depth: int = 0) -> int:
     if cache is None or depth > 8:
         return 0
     removed = 0
+    pending = getattr(cache, "_pending_store_tasks", None)
+    if isinstance(pending, set):
+        for task in list(pending):
+            try:
+                task.cancel()
+            except Exception:
+                pass
+        pending.clear()
     cache_dict = getattr(cache, "cache", None)
     if isinstance(cache_dict, dict):
         removed += len(cache_dict)
@@ -741,9 +1330,10 @@ def _clear_cache_obj(cache, lines: list[str], label: str, depth: int = 0) -> int
     return removed
 
 
-def _clear_comfy_execution_cache(log=None):
+def _clear_comfy_execution_cache(log=None, reset_executors: bool = True):
     lines: list[str] = []
     cleared_entries = 0
+    reset_count = 0
     try:
         executors = []
         try:
@@ -785,6 +1375,12 @@ def _clear_comfy_execution_cache(log=None):
                         obj.clear()
                     except Exception:
                         pass
+            if reset_executors and hasattr(executor, "reset"):
+                try:
+                    executor.reset()
+                    reset_count += 1
+                except Exception:
+                    pass
     except Exception as e:
         if log:
             log(f"  Comfy cache 清理异常: {type(e).__name__}: {e}")
@@ -798,40 +1394,24 @@ def _clear_comfy_execution_cache(log=None):
         pass
     gc.collect()
     if log:
-        log(f"  Comfy cache 轻清理完成: {cleared_entries} 个 entry")
+        log(f"  Comfy cache 轻清理完成: {cleared_entries} 个 entry, reset={reset_count}")
     return cleared_entries
 
 
-def _load_malloc_trim_module():
-    try:
-        import malloc_trim_node
-        return malloc_trim_node
-    except Exception:
-        pass
+def _run_post_segment_clean(log, deep: bool = True, unload_models: bool = False):
+    if unload_models:
+        try:
+            from comfy import model_management as _mm
+            _mm.unload_all_models()
+            log("  模型卸载: 已请求 unload_all_models")
+        except Exception as e:
+            log(f"  模型卸载失败: {type(e).__name__}: {e}")
 
-    try:
-        import importlib.util
-        path = os.path.join(folder_paths.base_path, "custom_nodes", "malloc_trim_node.py")
-        spec = importlib.util.spec_from_file_location("malloc_trim_node", path)
-        if spec and spec.loader:
-            module = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(module)
-            return module
-    except Exception:
-        return None
-    return None
-
-
-def _run_post_segment_clean(log, deep: bool = True):
-    _clear_comfy_execution_cache(log=log)
     if not deep:
-        return
-    module = _load_malloc_trim_module()
-    if module is None or not hasattr(module, "DeepRAMCleanNode"):
-        log("  深度段后清理: 未找到 malloc_trim_node.DeepRAMCleanNode，已完成轻清理")
+        _clear_comfy_execution_cache(log=log)
         return
     try:
-        cleaner = module.DeepRAMCleanNode()
+        cleaner = SegmentDeepRAMCleanNode()
         _, report = cleaner.deep_clean(
             wait_ffmpeg_subprocess=True,
             clear_executor_cache=True,
@@ -854,6 +1434,8 @@ def _run_post_segment_clean(log, deep: bool = True):
         log("  深度段后清理完成" + (": " + " / ".join(summary) if summary else ""))
     except Exception as e:
         log(f"  深度段后清理失败: {type(e).__name__}: {e}")
+    finally:
+        _clear_comfy_execution_cache(log=log)
 
 
 # ── 工具函数 ──────────────────────────────────────────────────────
@@ -905,6 +1487,222 @@ def _build_plan_text(total_frames, segments, start_from,
     return "\n".join(lines)
 
 
+# ── 内置 RAM 深度清理节点 ─────────────────────────────────────────
+
+class SegmentDeepRAMCleanNode:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "wait_ffmpeg_subprocess": (
+                    "BOOLEAN",
+                    {
+                        "default": True,
+                        "tooltip": "等待 ffmpeg 子进程结束。Windows + VHS/VideoCombine 场景建议保持开启。",
+                    },
+                ),
+                "clear_executor_cache": (
+                    "BOOLEAN",
+                    {"default": True, "tooltip": "深度清理 ComfyUI executor/caches 中的输出 tensor。"},
+                ),
+                "clear_cell_refs": (
+                    "BOOLEAN",
+                    {"default": True, "tooltip": "清理闭包 cell 中直接持有的大 CPU tensor。"},
+                ),
+                "clear_model_cpu_cache": (
+                    "BOOLEAN",
+                    {"default": True, "tooltip": "请求 ComfyUI model_management 释放模型缓存。"},
+                ),
+                "os_trim": (
+                    "BOOLEAN",
+                    {"default": True, "tooltip": "Windows 调 EmptyWorkingSet，Linux 调 malloc_trim。"},
+                ),
+                "forensic_tensor_refs": (
+                    "BOOLEAN",
+                    {"default": True, "tooltip": "输出大 CPU tensor 的直接引用者。日志会比较长。"},
+                ),
+                "forensic_executor": (
+                    "BOOLEAN",
+                    {"default": True, "tooltip": "分析 ComfyUI executor/cache 中的 tensor 占用。"},
+                ),
+                "forensic_models": (
+                    "BOOLEAN",
+                    {"default": True, "tooltip": "分析 comfy.model_management 当前加载模型。"},
+                ),
+                "forensic_subprocess": (
+                    "BOOLEAN",
+                    {"default": True, "tooltip": "分析当前 ComfyUI 子进程，尤其是 ffmpeg。"},
+                ),
+                "forensic_threads": (
+                    "BOOLEAN",
+                    {"default": True, "tooltip": "分析当前线程栈。"},
+                ),
+                "forensic_gc_garbage": (
+                    "BOOLEAN",
+                    {"default": True, "tooltip": "检查 gc.garbage。"},
+                ),
+            },
+            "optional": {
+                "any_input": ("*", {}),
+            },
+        }
+
+    RETURN_TYPES = ("*", "STRING")
+    RETURN_NAMES = ("passthrough", "report")
+    FUNCTION = "deep_clean"
+    CATEGORY = "video/utils"
+    OUTPUT_NODE = True
+
+    def deep_clean(
+        self,
+        wait_ffmpeg_subprocess=True,
+        clear_executor_cache=True,
+        clear_cell_refs=True,
+        clear_model_cpu_cache=True,
+        os_trim=True,
+        forensic_tensor_refs=True,
+        forensic_executor=True,
+        forensic_models=True,
+        forensic_subprocess=True,
+        forensic_threads=True,
+        forensic_gc_garbage=True,
+        any_input=None,
+    ):
+        input_was_connected = any_input is not None
+        any_input = None
+
+        torch = _sur_import_torch()
+        process = _sur_process()
+        lines = [
+            "=" * 60,
+            "SUR 内置 RAM 深度取证+清理报告",
+            f"   OS: {platform.system()}  Python: {sys.version.split()[0]}",
+            "=" * 60,
+        ]
+        if torch is None:
+            lines.append("提示: torch 不可用，tensor/VRAM 相关清理会跳过。")
+        if process is None:
+            lines.append("提示: psutil 不可用，进程/子进程 RAM 统计会跳过。")
+        if input_was_connected:
+            lines.append(
+                "提示: any_input 已在清理函数开头置空；若它接的是 IMAGE，"
+                "ComfyUI 输入缓存仍可能在本次 prompt 结束前持有大 tensor。"
+            )
+
+        ram0 = _sur_ram_gb(process)
+        vram0 = _sur_vram_gb(torch)
+        lines.append(f"初始: RAM={ram0:.2f}GB  VRAM={vram0:.2f}GB")
+
+        lines.append("\n── 取证（清理前）──")
+        if forensic_threads:
+            lines.append("")
+            _sur_analyze_threads(lines)
+        if forensic_subprocess:
+            lines.append("")
+            _sur_analyze_subprocesses(lines)
+        if forensic_executor:
+            lines.append("")
+            _sur_analyze_executor_cache(lines)
+        if forensic_models:
+            lines.append("")
+            _sur_analyze_models(lines)
+        if forensic_tensor_refs:
+            lines.append("")
+            _sur_trace_tensor_holders(lines)
+        if forensic_gc_garbage:
+            lines.append("")
+            _sur_check_gc_garbage(lines)
+
+        lines.append(f"\n取证结束: RAM={_sur_ram_gb(process):.2f}GB")
+        lines.append("\n── 清理 ──")
+
+        if wait_ffmpeg_subprocess:
+            lines.append("\n[0a] 等待 ffmpeg 子进程...")
+            _sur_wait_for_ffmpeg_subprocesses(lines)
+
+        lines.append("\n[0b] 等待 VHS/编码线程...")
+        _sur_wait_for_vhs_threads(lines)
+
+        c1 = gc.collect()
+        gc.collect()
+        lines.append(f"\n[1] GC 第一轮: 回收 {c1} 个  RAM={_sur_ram_gb(process):.2f}GB")
+
+        if clear_executor_cache:
+            r0 = _sur_ram_gb(process)
+            lines.append("\n[2] executor/cache 深度清理...")
+            executors = _sur_get_prompt_executors()
+            if executors:
+                total_tensors = 0
+                for executor, source in executors:
+                    total_tensors += _sur_deep_clear_executor(executor, source, torch, lines)
+                lines.append(f"  合计 resize tensor: {total_tensors} 个")
+            else:
+                lines.append("  ✗ executor 未找到")
+            gc.collect()
+            gc.collect()
+            lines.append(f"  清理后释放: {r0 - _sur_ram_gb(process):.2f}GB  RAM={_sur_ram_gb(process):.2f}GB")
+
+        if clear_cell_refs:
+            r0 = _sur_ram_gb(process)
+            lines.append("\n[3] cell 闭包引用清理...")
+            _sur_clear_cell_tensor_refs(lines)
+            gc.collect()
+            gc.collect()
+            lines.append(f"  清理后释放: {r0 - _sur_ram_gb(process):.2f}GB  RAM={_sur_ram_gb(process):.2f}GB")
+
+        if clear_model_cpu_cache:
+            r0 = _sur_ram_gb(process)
+            try:
+                import comfy.model_management as mm
+                mm.free_memory(1024**4, mm.get_torch_device())
+                gc.collect()
+                lines.append(f"\n[4] ComfyUI 模型缓存: 释放 {r0 - _sur_ram_gb(process):.2f}GB  RAM={_sur_ram_gb(process):.2f}GB")
+            except Exception as e:
+                lines.append(f"\n[4] ComfyUI 模型缓存: 失败 ({type(e).__name__}: {e})")
+
+        if torch is not None:
+            try:
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                    torch.cuda.ipc_collect()
+                    torch.cuda.synchronize()
+                    lines.append("\n[5] CUDA: empty_cache + ipc_collect + synchronize ✓")
+            except Exception as e:
+                lines.append(f"\n[5] CUDA 清理失败: {type(e).__name__}: {e}")
+
+        c2 = gc.collect()
+        gc.collect()
+        gc.collect()
+        lines.append(f"\n[6] GC 第二轮: 回收 {c2} 个  RAM={_sur_ram_gb(process):.2f}GB")
+
+        if os_trim:
+            r0 = _sur_ram_gb(process)
+            ok = _sur_trim_ram_os()
+            name = "Windows EmptyWorkingSet" if platform.system() == "Windows" else "malloc_trim"
+            lines.append(f"\n[7] {name}: {'✓' if ok else '✗'}  释放 {r0 - _sur_ram_gb(process):.2f}GB  RAM={_sur_ram_gb(process):.2f}GB")
+
+        lines.append("\n── 清理后验证 ──")
+        if forensic_tensor_refs:
+            lines.append("")
+            _sur_trace_tensor_holders(lines, max_tensors=5)
+        if forensic_subprocess:
+            lines.append("")
+            _sur_analyze_subprocesses(lines)
+
+        ram1 = _sur_ram_gb(process)
+        vram1 = _sur_vram_gb(torch)
+        lines.append("\n" + "=" * 60)
+        lines.append(f"RAM:  {ram0:.2f}GB -> {ram1:.2f}GB  (释放 {ram0 - ram1:.2f}GB)")
+        lines.append(f"VRAM: {vram0:.2f}GB -> {vram1:.2f}GB  (释放 {vram0 - vram1:.2f}GB)")
+        if ram0 - ram1 < 0.1:
+            lines.append("⚠ RAM 几乎未释放：请重点检查 tensor 引用链、未结束的 ffmpeg、以及仍在图内执行的预览/保存分支。")
+        lines.append("=" * 60)
+
+        report = "\n".join(lines)
+        print(report)
+        return (None, report)
+
+
 # ── SegmentFrameTrimmer 节点 ──────────────────────────────────────
 
 class SegmentFrameTrimmer:
@@ -933,10 +1731,20 @@ class SegmentFrameTrimmer:
                         "tooltip": "从帧序列头部裁掉的帧数，由 SegmentUpscaleRunner 自动控制。",
                     },
                 ),
+                "clone_output": (
+                    "BOOLEAN",
+                    {
+                        "default": False,
+                        "tooltip": (
+                            "高级选项。开启后会复制裁剪后的输出，避免 PyTorch 切片视图继续引用原始大张量；"
+                            "但会在保存前临时增加 RAM 占用。"
+                        ),
+                    },
+                ),
             }
         }
 
-    def trim(self, images, trim_frames: int):
+    def trim(self, images, trim_frames: int, clone_output=False):
         if images is None:
             raise ValueError(
                 "[SegmentFrameTrimmer] images 为 None，"
@@ -946,8 +1754,63 @@ class SegmentFrameTrimmer:
         n           = images.shape[0]
         trim_frames = max(0, min(int(trim_frames), n - 1))
         if trim_frames > 0:
-            return (images[trim_frames:],)
+            out = images[trim_frames:]
+            if clone_output:
+                out = out.clone()
+            return (out,)
         return (images,)
+
+
+# ── 日志显示节点 ─────────────────────────────────────────────────
+
+class SegmentRunLogViewer:
+    CATEGORY = "video/utils"
+    FUNCTION = "show_log"
+    OUTPUT_NODE = True
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("log_text",)
+
+    @classmethod
+    def IS_CHANGED(cls, **kwargs):
+        return float("nan")
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "runner_node_id": (
+                    "STRING",
+                    {
+                        "default": "",
+                        "tooltip": "填写 SegmentUpscaleRunner 的节点 ID。留空时显示当前内存中所有 Runner 日志。",
+                    },
+                ),
+                "max_lines": (
+                    "INT",
+                    {
+                        "default": 300,
+                        "min": 20,
+                        "max": 3000,
+                        "step": 20,
+                        "tooltip": "最多显示多少行日志。",
+                    },
+                ),
+                "clear_after_read": (
+                    "BOOLEAN",
+                    {
+                        "default": False,
+                        "tooltip": "读取后清空该 Runner 日志。runner_node_id 留空时不会清空所有日志。",
+                    },
+                ),
+            }
+        }
+
+    def show_log(self, runner_node_id="", max_lines=300, clear_after_read=False):
+        text = _sur_log_text(runner_node_id, max_lines)
+        if clear_after_read and str(runner_node_id or "").strip():
+            _sur_log_clear(str(runner_node_id).strip())
+        return {"ui": {"text": [text]}, "result": (text,)}
+
 
 # ── 主节点 ────────────────────────────────────────────────────────
 
@@ -1057,14 +1920,14 @@ class SegmentUpscaleRunner:
                     "BOOLEAN",
                     {
                         "default": True,
-                        "tooltip": "每段完成后清理 ComfyUI 执行缓存、CUDA 缓存和 Python GC，复刻 Queue Runner 的段间释放节奏。",
+                        "tooltip": "每段完成后清理 ComfyUI 执行缓存、CUDA 缓存和 Python GC。",
                     },
                 ),
                 "deep_cleanup_between_segments": (
                     "BOOLEAN",
                     {
                         "default": True,
-                        "tooltip": "启用时会调用 custom_nodes/malloc_trim_node.py 的 DeepRAMCleanNode 做更彻底的段后清理。",
+                        "tooltip": "启用时调用本插件内置的 SegmentDeepRAMCleanNode 做更彻底的段后清理。",
                     },
                 ),
                 "prune_cleanup_debug_nodes": (
@@ -1077,11 +1940,26 @@ class SegmentUpscaleRunner:
                 "cleanup_node_selectors": (
                     "STRING",
                     {
-                        "default": "DeepRAMCleanNode,VRAM_Debug,easy showAnything",
+                        "default": "DeepRAMCleanNode,VRAM_Debug,easy showAnything,PreviewImage,SaveImage",
                         "tooltip": (
                             "要从子 prompt 移除的节点 ID 或 class_type，逗号分隔。\n"
-                            "下游 show/debug/preview 节点会一起移除。"
+                            "下游 show/debug/preview 节点会一起移除。\n"
+                            "建议把不需要执行的预览、调试、保存图片节点都加进来。"
                         ),
+                    },
+                ),
+                "clear_segment_history": (
+                    "BOOLEAN",
+                    {
+                        "default": True,
+                        "tooltip": "每段成功记录输出路径后删除该子 prompt 的 history，减少长任务中的历史记录内存积压。",
+                    },
+                ),
+                "unload_models_between_segments": (
+                    "BOOLEAN",
+                    {
+                        "default": False,
+                        "tooltip": "更激进的段间清理：每段后卸载模型。能释放更多内存，但下一段会重新加载模型、速度更慢。",
                     },
                 ),
                 "merge_segments": (
@@ -1170,7 +2048,9 @@ class SegmentUpscaleRunner:
         cleanup_between_segments=True,
         deep_cleanup_between_segments=True,
         prune_cleanup_debug_nodes=True,
-        cleanup_node_selectors="DeepRAMCleanNode,VRAM_Debug,easy showAnything",
+        cleanup_node_selectors="DeepRAMCleanNode,VRAM_Debug,easy showAnything,PreviewImage,SaveImage",
+        clear_segment_history=True,
+        unload_models_between_segments=False,
         merge_segments=False,
         merged_filename_prefix="sur_merged",
         enable_checkpoint=True,
@@ -1195,6 +2075,8 @@ class SegmentUpscaleRunner:
         cleanup_between_segments = bool(cleanup_between_segments)
         deep_cleanup_between_segments = bool(deep_cleanup_between_segments)
         prune_cleanup_debug_nodes = bool(prune_cleanup_debug_nodes)
+        clear_segment_history = bool(clear_segment_history)
+        unload_models_between_segments = bool(unload_models_between_segments)
         merge_segments = bool(merge_segments)
         cleanup_selectors = _parse_selectors(cleanup_node_selectors)
         merged_filename_prefix = (merged_filename_prefix or "sur_merged").strip() or "sur_merged"
@@ -1210,8 +2092,9 @@ class SegmentUpscaleRunner:
         def log(msg):
             _sur_log(uid, f"[SUR] {msg}")
 
-        full_prompt = (extra_pnginfo or {}).get("sqr_full_prompt") or prompt
-        client_id   = str((extra_pnginfo or {}).get("sqr_client_id") or "")
+        extra_info = extra_pnginfo if isinstance(extra_pnginfo, dict) else {}
+        full_prompt = extra_info.get("sur_full_prompt") or prompt
+        client_id   = str(extra_info.get("sur_client_id") or "")
         trim_multiplier, trim_note = _infer_trimmer_trim_multiplier(full_prompt, trimmer_nid)
         if trim_override > 0:
             trim_multiplier, trim_note = trim_override, "手动覆盖"
@@ -1318,6 +2201,8 @@ class SegmentUpscaleRunner:
                     "段间清理="
                     + ("开" if cleanup_between_segments else "关")
                     + ("（深度）" if cleanup_between_segments and deep_cleanup_between_segments else "")
+                    + ("  模型卸载=开" if cleanup_between_segments and unload_models_between_segments else "")
+                    + f"  history清理={'开' if clear_segment_history else '关'}"
                     + f"  图内清理分支裁剪={'开' if prune_cleanup_debug_nodes else '关'}"
                 )
 
@@ -1380,6 +2265,8 @@ class SegmentUpscaleRunner:
                         del wf[str(uid)]
 
                     # 6. 提交、等待、段后清理
+                    segment_failed = False
+                    pid = ""
                     try:
                         pid = _queue_prompt(wf, client_id=client_id)
                         log(f"  已提交 prompt_id={pid[:8]}...  等待完成...")
@@ -1412,13 +2299,26 @@ class SegmentUpscaleRunner:
                             elapsed = time.time() - _t0
                             frames_done = sum(max(0, lmt - trm) for _, _, lmt, trm in segs_to_run[:run_index + 1])
                             _sur_save_speed_record(elapsed, frames_done)
+                            if clear_segment_history:
+                                _sur_delete_prompt_history(pid, log=log)
                         else:
-                            log(f"✗ 第{seg_num}段执行出错，已跳过")
+                            segment_failed = True
+                            log(f"✗ 第{seg_num}段执行出错，已终止后续分段")
+                    except Exception as e:
+                        segment_failed = True
+                        log(f"✗ 第{seg_num}段提交失败: {type(e).__name__}: {e}")
+                    finally:
+                        wf = None
                         if cleanup_between_segments:
                             time.sleep(0.5)
-                            _run_post_segment_clean(log, deep=deep_cleanup_between_segments)
-                    except Exception as e:
-                        log(f"✗ 第{seg_num}段提交失败: {type(e).__name__}: {e}")
+                            _run_post_segment_clean(
+                                log,
+                                deep=deep_cleanup_between_segments,
+                                unload_models=unload_models_between_segments,
+                            )
+
+                    if segment_failed:
+                        break
 
                 if merge_segments:
                     if len(segment_output_paths) >= 2:
@@ -1583,9 +2483,15 @@ async def sur_upload_video_api(request):
 NODE_CLASS_MAPPINGS = {
     "SegmentUpscaleRunner": SegmentUpscaleRunner,
     "SegmentFrameTrimmer":  SegmentFrameTrimmer,
+    "SegmentRunLogViewer":  SegmentRunLogViewer,
+    "SegmentDeepRAMCleanNode": SegmentDeepRAMCleanNode,
+    "DeepRAMCleanNode": SegmentDeepRAMCleanNode,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "SegmentUpscaleRunner": "Segment Upscale Runner 🎬",
     "SegmentFrameTrimmer":  "Segment Frame Trimmer ✂️",
+    "SegmentRunLogViewer":  "Segment Run Log Viewer 📋",
+    "SegmentDeepRAMCleanNode": "Segment Deep RAM Cleaner",
+    "DeepRAMCleanNode": "Segment Deep RAM Cleaner",
 }
