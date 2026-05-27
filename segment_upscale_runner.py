@@ -1304,6 +1304,74 @@ def _sur_clear_cell_tensor_refs(lines: list[str], size_threshold_gb: float = 0.0
     return cleared
 
 
+def _sur_is_video_like_tensor(tensor) -> bool:
+    try:
+        shape = list(tensor.shape)
+        if len(shape) != 4:
+            return False
+        if int(shape[-1]) not in (1, 3, 4):
+            return False
+        if int(shape[0]) < 1 or int(shape[1]) < 64 or int(shape[2]) < 64:
+            return False
+        return True
+    except Exception:
+        return False
+
+
+def _sur_aggressive_clear_video_tensors(lines: list[str], size_threshold_gb: float = 0.05, max_shapes: int = 12) -> int:
+    torch = _sur_import_torch()
+    if torch is None:
+        lines.append("  残留视频 tensor 清理: torch 不可用，跳过")
+        return 0
+    candidates = []
+    seen = set()
+    try:
+        for obj in gc.get_objects():
+            try:
+                if id(obj) in seen:
+                    continue
+                if isinstance(obj, torch.Tensor) and not obj.is_cuda and _sur_is_video_like_tensor(obj):
+                    gb = _sur_tensor_gb(obj)
+                    if gb >= size_threshold_gb:
+                        seen.add(id(obj))
+                        candidates.append((gb, obj, list(obj.shape), str(obj.dtype)))
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    if not candidates:
+        lines.append("  残留视频 tensor 清理: 未发现大 IMAGE/VIDEO tensor ✓")
+        return 0
+
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    total_gb = 0.0
+    cleared = 0
+    shapes = []
+    for gb, tensor, shape, dtype in candidates:
+        try:
+            if _sur_zero_tensor_storage(tensor):
+                cleared += 1
+                total_gb += gb
+                if len(shapes) < max_shapes:
+                    shapes.append(f"{shape}/{dtype}/{gb:.2f}GB")
+        except Exception:
+            continue
+
+    candidates.clear()
+    gc.collect()
+    gc.collect()
+    if cleared:
+        lines.append(
+            f"  残留视频 tensor 清理: {cleared} 个 IMAGE/VIDEO tensor 已 resize_(0)，"
+            f"合计约 {total_gb:.2f}GB"
+        )
+        lines.append("  shapes: " + "; ".join(shapes))
+    else:
+        lines.append("  残留视频 tensor 清理: 发现候选但无法 resize")
+    return cleared
+
+
 def _sur_trace_tensor_holders(lines: list[str], size_threshold_gb: float = 0.05, max_tensors: int = 8):
     torch = _sur_import_torch()
     if torch is None:
@@ -1610,6 +1678,7 @@ def _run_post_segment_clean(log, deep: bool = True, unload_models: bool = False)
             forensic_subprocess=False,
             forensic_threads=False,
             forensic_gc_garbage=False,
+            aggressive_video_tensor_cleanup=True,
             any_input=None,
         )
         summary = [
@@ -1759,6 +1828,7 @@ class SegmentDeepRAMCleanNode:
         forensic_subprocess=True,
         forensic_threads=True,
         forensic_gc_garbage=True,
+        aggressive_video_tensor_cleanup=False,
         any_input=None,
     ):
         input_was_connected = any_input is not None
@@ -1839,6 +1909,14 @@ class SegmentDeepRAMCleanNode:
             r0 = _sur_ram_gb(process)
             lines.append("\n[3] cell 闭包引用清理...")
             _sur_clear_cell_tensor_refs(lines)
+            gc.collect()
+            gc.collect()
+            lines.append(f"  清理后释放: {r0 - _sur_ram_gb(process):.2f}GB  RAM={_sur_ram_gb(process):.2f}GB")
+
+        if aggressive_video_tensor_cleanup:
+            r0 = _sur_ram_gb(process)
+            lines.append("\n[3b] 残留 IMAGE/VIDEO tensor 强清理...")
+            _sur_aggressive_clear_video_tensors(lines)
             gc.collect()
             gc.collect()
             lines.append(f"  清理后释放: {r0 - _sur_ram_gb(process):.2f}GB  RAM={_sur_ram_gb(process):.2f}GB")
