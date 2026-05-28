@@ -160,5 +160,27 @@
         "tooltip": "読み取り後にこの Runner のログを削除します。runner_node_id が空欄の場合、全ログ削除は行いません。"
       }
     }
+  },
+  "SegmentVideoInfoProbe": {
+    "display_name": "動画情報プローブ",
+    "description": "IMAGE tensor を読み込まず、動画メタデータだけから総フレーム数と FPS を出力します。物理分割モード向けです。",
+    "inputs": {
+      "video": {
+        "name": "動画",
+        "tooltip": "元動画のファイル名またはパス。ComfyUI/input 内のファイル名も使えます。"
+      },
+      "force_rate": {
+        "name": "強制 FPS",
+        "tooltip": "VHS_LoadVideo.force_rate と同じ値にします。0 は元動画の FPS を使います。"
+      },
+      "skip_first_frames": {
+        "name": "先頭スキップフレーム",
+        "tooltip": "VHS_LoadVideo.skip_first_frames と同じ値にします。"
+      },
+      "frame_load_cap": {
+        "name": "処理フレーム数",
+        "tooltip": "処理する総フレーム数。0 は skip 後から動画末尾まで処理します。"
+      }
+    }
   }
 }

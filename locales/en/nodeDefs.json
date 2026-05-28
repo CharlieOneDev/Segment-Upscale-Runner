@@ -160,5 +160,27 @@
         "tooltip": "Clear this runner log after reading. Empty runner_node_id will not clear all logs."
       }
     }
+  },
+  "SegmentVideoInfoProbe": {
+    "display_name": "Video Info Probe",
+    "description": "Read only video metadata and output frame count/fps without loading IMAGE tensors. Useful for physical slice mode.",
+    "inputs": {
+      "video": {
+        "name": "Video",
+        "tooltip": "Source video filename or path. Input-folder filenames are supported."
+      },
+      "force_rate": {
+        "name": "Force FPS",
+        "tooltip": "Match VHS_LoadVideo.force_rate. Use 0 to keep the source FPS."
+      },
+      "skip_first_frames": {
+        "name": "Skip First Frames",
+        "tooltip": "Match VHS_LoadVideo.skip_first_frames."
+      },
+      "frame_load_cap": {
+        "name": "Frame Load Cap",
+        "tooltip": "Total frames to process. 0 means process until the end after skip."
+      }
+    }
   }
 }

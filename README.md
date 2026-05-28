@@ -200,6 +200,18 @@ ComfyUI/output/SUR_physical_segments/{timestamp}/results/
 最后自动合并也会从这个 results 目录内的分段成果生成最终视频。物理分片模式下建议把
 `audio_mode` 设为 `segment_from_loadvideo`，这样音频会按最终保存帧范围从原始源视频切段，避免重叠上下文导致音频多出前置片段。
 
+为了让主 prompt 不先执行 `VHS_LoadVideo` 并制造 IMAGE tensor，物理分片模式推荐新增
+`SegmentVideoInfoProbe`：
+
+```text
+SegmentVideoInfoProbe.total_frames -> SegmentUpscaleRunner.total_frames
+SegmentVideoInfoProbe.frame_rate   -> SegmentUpscaleRunner.frame_rate
+```
+
+`SegmentVideoInfoProbe` 只读取视频元信息，不解码整段视频。它的 `video`、`force_rate`、
+`skip_first_frames`、`frame_load_cap` 应与源 `VHS_LoadVideo` 保持一致；源 `VHS_LoadVideo`
+节点仍然保留在工作流里，Runner 会在每个子 prompt 中把它改成当前小片段。
+
 ## 使用步骤
 
 1. 在 RIFE/VFI 前加 `SegmentVfiBridgeTrimmer`，在 VideoCombine 前加 `SegmentFrameTrimmer`。

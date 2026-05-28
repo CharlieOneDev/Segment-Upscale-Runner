@@ -160,5 +160,27 @@
         "tooltip": "读取后清空该 Runner 日志。runner_node_id 留空时不会清空所有日志。"
       }
     }
+  },
+  "SegmentVideoInfoProbe": {
+    "display_name": "视频信息轻量探测器",
+    "description": "只读取视频元信息并输出总帧数/帧率，不加载 IMAGE tensor，适合物理分片模式。",
+    "inputs": {
+      "video": {
+        "name": "视频",
+        "tooltip": "源视频文件名或路径。可填写 ComfyUI/input 下的视频文件名。"
+      },
+      "force_rate": {
+        "name": "强制帧率",
+        "tooltip": "与 VHS_LoadVideo.force_rate 保持一致。0 表示使用源视频帧率。"
+      },
+      "skip_first_frames": {
+        "name": "跳过前 X 帧",
+        "tooltip": "与 VHS_LoadVideo.skip_first_frames 保持一致。"
+      },
+      "frame_load_cap": {
+        "name": "处理总帧数",
+        "tooltip": "要处理的总帧数。0 表示从 skip 后一直处理到视频末尾。"
+      }
+    }
   }
 }

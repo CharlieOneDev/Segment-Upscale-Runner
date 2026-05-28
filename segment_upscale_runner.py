@@ -660,6 +660,76 @@ def _sur_get_output_video_info(prompt_id: str, combine_node_id: str, log=None):
     return None, None
 
 
+def _sur_parse_rate(text) -> float:
+    raw = str(text or "").strip()
+    if not raw or raw in ("0/0", "N/A"):
+        return 0.0
+    if "/" in raw:
+        a, b = raw.split("/", 1)
+        try:
+            den = float(b)
+            return float(a) / den if den else 0.0
+        except Exception:
+            return 0.0
+    try:
+        return float(raw)
+    except Exception:
+        return 0.0
+
+
+def _sur_probe_video_info(path: str) -> tuple[int, float]:
+    real = _sur_resolve_media_path(path) or os.path.realpath(str(path or ""))
+    if not os.path.isfile(real):
+        raise FileNotFoundError(path)
+
+    ffprobe = shutil.which("ffprobe") or "ffprobe"
+    cmd = [
+        ffprobe, "-v", "error", "-select_streams", "v:0",
+        "-show_entries", "stream=avg_frame_rate,r_frame_rate,nb_frames,duration:format=duration",
+        "-of", "json", real,
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=20)
+        if result.returncode == 0 and result.stdout:
+            data = json.loads(result.stdout)
+            streams = data.get("streams") or []
+            stream = streams[0] if streams else {}
+            fps = _sur_parse_rate(stream.get("avg_frame_rate")) or _sur_parse_rate(stream.get("r_frame_rate"))
+            frames = 0
+            nb_frames = stream.get("nb_frames")
+            if nb_frames not in (None, "", "N/A"):
+                try:
+                    frames = int(float(nb_frames))
+                except Exception:
+                    frames = 0
+            duration = 0.0
+            for src in (stream, data.get("format") or {}):
+                try:
+                    duration = max(duration, float(src.get("duration") or 0))
+                except Exception:
+                    pass
+            if frames <= 0 and fps > 0 and duration > 0:
+                frames = int(round(duration * fps))
+            if frames > 0 and fps > 0:
+                return frames, fps
+    except Exception:
+        pass
+
+    try:
+        import cv2
+        cap = cv2.VideoCapture(real)
+        if cap.isOpened():
+            fps = float(cap.get(cv2.CAP_PROP_FPS) or 0)
+            frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+            cap.release()
+            if frames > 0 and fps > 0:
+                return frames, fps
+    except Exception:
+        pass
+
+    raise RuntimeError(f"无法读取视频信息: {real}")
+
+
 def _sur_delete_prompt_history(prompt_id: str, log=None) -> bool:
     if not prompt_id:
         return False
@@ -1970,6 +2040,61 @@ class SegmentRunLogViewer:
         return {"ui": {"text": [text]}, "result": (text,)}
 
 
+class SegmentVideoInfoProbe:
+    CATEGORY = "video/utils"
+    FUNCTION = "probe"
+    RETURN_TYPES = ("INT", "FLOAT", "INT", "FLOAT")
+    RETURN_NAMES = ("total_frames", "frame_rate", "source_total_frames", "source_fps")
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "video": (
+                    "STRING",
+                    {
+                        "default": "",
+                        "tooltip": "源视频文件名或路径。可填写 ComfyUI/input 下的视频文件名。",
+                    },
+                ),
+                "force_rate": (
+                    "FLOAT",
+                    {
+                        "default": 0.0, "min": 0.0, "max": 120.0, "step": 1.0,
+                        "tooltip": "与 VHS_LoadVideo.force_rate 保持一致。0 表示使用源视频帧率。",
+                    },
+                ),
+                "skip_first_frames": (
+                    "INT",
+                    {
+                        "default": 0, "min": 0, "max": 999999, "step": 1,
+                        "tooltip": "与 VHS_LoadVideo.skip_first_frames 保持一致，用于只处理源视频后半段。",
+                    },
+                ),
+                "frame_load_cap": (
+                    "INT",
+                    {
+                        "default": 0, "min": 0, "max": 999999, "step": 1,
+                        "tooltip": "要处理的总帧数。0 表示从 skip 后一直处理到视频末尾。",
+                    },
+                ),
+            }
+        }
+
+    def probe(self, video="", force_rate=0.0, skip_first_frames=0, frame_load_cap=0):
+        source_total, source_fps = _sur_probe_video_info(video)
+        skip = max(0, int(skip_first_frames or 0))
+        cap = max(0, int(frame_load_cap or 0))
+        out_fps = float(force_rate or 0) or source_fps
+        available = max(0, source_total - skip)
+
+        if force_rate and source_fps > 0 and abs(float(force_rate) - source_fps) > 0.001:
+            available = int(available / source_fps * float(force_rate))
+
+        total = min(cap, available) if cap > 0 else available
+        return (int(total), float(out_fps), int(source_total), float(source_fps))
+
+
 # ── 主节点 ────────────────────────────────────────────────────────
 
 class SegmentUpscaleRunner:
@@ -2774,6 +2899,7 @@ NODE_CLASS_MAPPINGS = {
     "SegmentFrameTrimmer":  SegmentFrameTrimmer,
     "SegmentVfiBridgeTrimmer": SegmentVfiBridgeTrimmer,
     "SegmentRunLogViewer":  SegmentRunLogViewer,
+    "SegmentVideoInfoProbe": SegmentVideoInfoProbe,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -2781,5 +2907,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "SegmentFrameTrimmer":  "Segment Final Frame Trimmer ✂️",
     "SegmentVfiBridgeTrimmer": "Segment VFI Bridge Trimmer",
     "SegmentRunLogViewer":  "Segment Run Log Viewer 📋",
+    "SegmentVideoInfoProbe": "Segment Video Info Probe",
 }
 

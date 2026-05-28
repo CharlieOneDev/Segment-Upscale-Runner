@@ -63,5 +63,15 @@
       "max_lines": "最大行数",
       "clear_after_read": "读取后清空"
     }
+  },
+  "SegmentVideoInfoProbe": {
+    "title": "视频信息轻量探测器",
+    "description": "只读取视频元信息并输出总帧数/帧率，不加载 IMAGE tensor，适合物理分片模式。",
+    "widgets": {
+      "video": "视频",
+      "force_rate": "强制帧率",
+      "skip_first_frames": "跳过前 X 帧",
+      "frame_load_cap": "处理总帧数"
+    }
   }
 }
