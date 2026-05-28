@@ -20,8 +20,8 @@
         "tooltip": "何番目のセグメントから開始するかを指定します。手動再開時に使います。"
       },
       "overlap_frames": {
-        "name": "オーバーラップフレーム",
-        "tooltip": "前セグメント末尾から再利用する入力コンテキストフレーム数です。生成後の重複部分は SegmentFrameTrimmer で削除されます。"
+        "name": "モデル用コンテキスト重複",
+        "tooltip": "アップスケールやノイズ除去などの時間方向モデル用に、前セグメント末尾から追加で読み込む入力フレーム数です。"
       },
       "execute": {
         "name": "実行",
@@ -36,36 +36,28 @@
         "tooltip": "VHS_VideoCombine のノード ID。"
       },
       "trimmer_node_id": {
-        "name": "トリマーノード ID",
-        "tooltip": "SegmentFrameTrimmer のノード ID。overlap_frames が 0 より大きい場合は必須です。"
+        "name": "最終重複削除トリマー ID",
+        "tooltip": "SegmentFrameTrimmer のノード ID。RIFE/VFI の後、VHS_VideoCombine の前に置きます。"
+      },
+      "bridge_trimmer_node_id": {
+        "name": "VFI 前ブリッジトリマー ID",
+        "tooltip": "SegmentVfiBridgeTrimmer のノード ID。アップスケール/ノイズ除去の後、RIFE/VFI の前に置き、重複区間全体の再補間を避けます。"
+      },
+      "vfi_bridge_frames": {
+        "name": "VFI ブリッジフレーム",
+        "tooltip": "RIFE/VFI に入れる前セグメント末尾フレーム数です。通常は 1、境界が揺れる場合は 2 を試してください。"
       },
       "trim_multiplier_override": {
-        "name": "トリム倍率上書き",
-        "tooltip": "0 = Trimmer 上流の RIFE/VFI 倍率を自動検出。失敗する場合は 2、4 などを手動指定します。"
-      },
-      "cleanup_between_segments": {
-        "name": "セグメント間クリーンアップ",
-        "tooltip": "各セグメント完了後に ComfyUI 実行キャッシュ、CUDA キャッシュ、Python GC を実行します。"
-      },
-      "deep_cleanup_between_segments": {
-        "name": "ディープクリーンアップ",
-        "tooltip": "各セグメント完了後に内蔵の SegmentDeepRAMCleanNode クリーンアップコアを呼び出します。"
+        "name": "補間出力倍率",
+        "tooltip": "0 = 最終トリマー上流の RIFE/VFI 倍率を自動検出。失敗する場合は 2、4 などを手動指定します。"
       },
       "prune_cleanup_debug_nodes": {
-        "name": "デバッグ分岐を削除",
-        "tooltip": "各子 prompt からクリーンアップ、デバッグ、プレビュー、一時保存分岐を削除します。"
-      },
-      "cleanup_node_selectors": {
-        "name": "削除ノード指定",
-        "tooltip": "子 prompt から削除するノード ID または class type をカンマ区切りで指定します。"
+        "name": "プレビュー/デバッグ分岐をスキップ",
+        "tooltip": "各子 prompt から preview、show、debug、旧クリーンアップ分岐をスキップします。メモリ解放機能ではありません。"
       },
       "clear_segment_history": {
         "name": "セグメント履歴を削除",
-        "tooltip": "出力パスを記録した後、完了した子 prompt の history を削除して長時間タスクのメモリ蓄積を減らします。"
-      },
-      "unload_models_between_segments": {
-        "name": "セグメント間でモデルをアンロード",
-        "tooltip": "より強い解放です。メモリを多く解放できますが、次のセグメントでモデルを再読み込みします。"
+        "tooltip": "出力パスを記録した後、完了した子 prompt の history を削除します。"
       },
       "merge_segments": {
         "name": "セグメントを結合",
@@ -89,7 +81,7 @@
       },
       "pre_segment_paths": {
         "name": "前置セグメントパス",
-        "tooltip": "既に完了しているセグメント動画パスをカンマ区切りで指定します。結合時に新しい出力の前に置かれます。"
+        "tooltip": "既に完了しているセグメント動画パスをカンマ区切りで指定します。"
       },
       "reference_image_node_id": {
         "name": "参照画像ノード ID",
@@ -97,28 +89,57 @@
       },
       "segment_reference_images": {
         "name": "セグメント参照画像",
-        "tooltip": "任意。セグメントごとの参照画像パスまたはファイル名をカンマ区切りで指定します。不足分は最後の画像を再利用します。"
+        "tooltip": "任意。セグメントごとの参照画像パスまたはファイル名をカンマ区切りで指定します。"
       },
       "audio_mode": {
         "name": "音声モード",
         "tooltip": "keep_original = 現在の音声接続を維持；segment_from_loadvideo = 元動画からセグメントごとに音声を切り出す；disable_audio = 音声を削除。"
+      },
+      "segment_io_mode": {
+        "name": "セグメント入力モード",
+        "tooltip": "frame_window = 通常の skip/cap モード；physical_slices = 元動画を input 内の小さな動画に切り出してから、1 セグメントずつ処理します。"
+      },
+      "physical_slice_subdir": {
+        "name": "物理分割フォルダー",
+        "tooltip": "元スライスは input/フォルダー/タイムスタンプ/source、結果は output/フォルダー/タイムスタンプ/results に保存されます。"
+      },
+      "physical_slice_crf": {
+        "name": "スライス CRF",
+        "tooltip": "中間スライス動画の H.264 CRF。12 は高品質、0 はほぼロスレスですがファイルが大きくなります。"
+      },
+      "reuse_physical_slices": {
+        "name": "既存スライスを再利用",
+        "tooltip": "同じタイムスタンプで再開する場合、既存の元スライスを再利用します。"
       }
     }
   },
   "SegmentFrameTrimmer": {
-    "display_name": "セグメントフレームトリマー",
-    "description": "保存前にセグメント先頭の重複フレームを削除します。",
+    "display_name": "最終重複削除フレームトリマー",
+    "description": "保存前に重複ブリッジフレームを削除します。SegmentUpscaleRunner が自動制御します。",
     "inputs": {
       "images": {
         "name": "画像シーケンス"
       },
       "trim_frames": {
-        "name": "削除フレーム数",
-        "tooltip": "先頭から削除するフレーム数です。SegmentUpscaleRunner が自動設定します。"
+        "name": "自動出力削除フレーム数",
+        "tooltip": "SegmentUpscaleRunner が自動設定します。通常は手動変更しないでください。"
       },
-      "clone_output": {
-        "name": "出力をコピー",
-        "tooltip": "上級者向け。トリム結果をコピーして元の大きな tensor 参照を切りますが、一時的な RAM 使用量が増えます。"
+      "tail_trim_frames": {
+        "name": "自動末尾削除フレーム数",
+        "tooltip": "セグメント末尾で VFI が補った重複フレームを削除するため、SegmentUpscaleRunner が自動設定します。"
+      }
+    }
+  },
+  "SegmentVfiBridgeTrimmer": {
+    "display_name": "VFI 前ブリッジトリマー",
+    "description": "アップスケール/ノイズ除去の後、RIFE/VFI の前に置き、補間に必要なブリッジフレームだけを残します。",
+    "inputs": {
+      "images": {
+        "name": "画像シーケンス"
+      },
+      "trim_frames": {
+        "name": "自動コンテキスト削除フレーム数",
+        "tooltip": "SegmentUpscaleRunner が自動設定します。通常は手動変更しないでください。"
       }
     }
   },
@@ -139,27 +160,5 @@
         "tooltip": "読み取り後にこの Runner のログを削除します。runner_node_id が空欄の場合、全ログ削除は行いません。"
       }
     }
-  },
-  "SegmentDeepRAMCleanNode": {
-    "display_name": "セグメント Deep RAM クリーナー",
-    "description": "Segment Upscale Runner 内蔵の RAM 詳細診断とクリーンアップノードです。",
-    "inputs": {
-      "wait_ffmpeg_subprocess": {"name": "ffmpeg を待機"},
-      "clear_executor_cache": {"name": "実行キャッシュをクリア"},
-      "clear_cell_refs": {"name": "cell 参照をクリア"},
-      "clear_model_cpu_cache": {"name": "モデル CPU キャッシュをクリア"},
-      "os_trim": {"name": "OS メモリ解放"},
-      "forensic_tensor_refs": {"name": "tensor 参照診断"},
-      "forensic_executor": {"name": "executor 診断"},
-      "forensic_models": {"name": "モデル診断"},
-      "forensic_subprocess": {"name": "子プロセス診断"},
-      "forensic_threads": {"name": "スレッド診断"},
-      "forensic_gc_garbage": {"name": "GC ガベージ診断"},
-      "any_input": {"name": "任意入力"}
-    }
-  },
-  "DeepRAMCleanNode": {
-    "display_name": "セグメント Deep RAM クリーナー",
-    "description": "内蔵 Segment Deep RAM Cleaner の互換エイリアスです。"
   }
 }

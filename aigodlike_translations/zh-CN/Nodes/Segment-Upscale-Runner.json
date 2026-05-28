@@ -9,18 +9,16 @@
     "widgets": {
       "segment_count": "分段数",
       "start_segment": "起始段",
-      "overlap_frames": "重叠帧",
+      "overlap_frames": "模型上下文重叠帧",
       "execute": "执行",
       "load_video_node_id": "载入视频节点 ID",
       "combine_video_node_id": "视频合成节点 ID",
-      "trimmer_node_id": "裁帧节点 ID",
-      "trim_multiplier_override": "裁剪倍率覆盖",
-      "cleanup_between_segments": "段间清理",
-      "deep_cleanup_between_segments": "深度清理",
-      "prune_cleanup_debug_nodes": "移除调试分支",
-      "cleanup_node_selectors": "清理节点选择器",
+      "trimmer_node_id": "最终去重裁帧节点 ID",
+      "bridge_trimmer_node_id": "VFI 前桥接裁剪节点 ID",
+      "vfi_bridge_frames": "VFI 桥接帧",
+      "trim_multiplier_override": "插帧输出倍率",
+      "prune_cleanup_debug_nodes": "跳过预览/调试旁路",
       "clear_segment_history": "清理分段历史",
-      "unload_models_between_segments": "段间卸载模型",
       "merge_segments": "合并分段",
       "merged_filename_prefix": "合并文件名前缀",
       "enable_checkpoint": "启用 checkpoint",
@@ -29,18 +27,32 @@
       "pre_segment_paths": "前置分段路径",
       "reference_image_node_id": "参考图节点 ID",
       "segment_reference_images": "分段参考图",
-      "audio_mode": "音频模式"
+      "audio_mode": "音频模式",
+      "segment_io_mode": "分段输入模式",
+      "physical_slice_subdir": "物理分片目录",
+      "physical_slice_crf": "分片 CRF",
+      "reuse_physical_slices": "复用已有分片"
     }
   },
   "SegmentFrameTrimmer": {
-    "title": "分段裁帧器",
-    "description": "保存前裁掉分段开头的重叠帧。",
+    "title": "最终去重裁帧器",
+    "description": "保存前裁掉分段开头的重复桥接帧。由 Runner 自动控制。",
     "inputs": {
       "images": "图像序列"
     },
     "widgets": {
-      "trim_frames": "裁掉帧数",
-      "clone_output": "复制输出"
+      "trim_frames": "自动裁掉输出帧数",
+      "tail_trim_frames": "自动裁掉尾部帧数"
+    }
+  },
+  "SegmentVfiBridgeTrimmer": {
+    "title": "VFI 前桥接裁剪器",
+    "description": "放在放大/去噪之后、RIFE/VFI 之前，只保留少量桥接帧给插帧节点。",
+    "inputs": {
+      "images": "图像序列"
+    },
+    "widgets": {
+      "trim_frames": "自动裁掉上下文帧数"
     }
   },
   "SegmentRunLogViewer": {
@@ -51,29 +63,5 @@
       "max_lines": "最大行数",
       "clear_after_read": "读取后清空"
     }
-  },
-  "SegmentDeepRAMCleanNode": {
-    "title": "分段深度 RAM 清理器",
-    "description": "Segment Upscale Runner 内置的 RAM 深度取证与清理节点。",
-    "inputs": {
-      "any_input": "任意输入"
-    },
-    "widgets": {
-      "wait_ffmpeg_subprocess": "等待 ffmpeg",
-      "clear_executor_cache": "清理执行缓存",
-      "clear_cell_refs": "清理闭包引用",
-      "clear_model_cpu_cache": "清理模型 CPU 缓存",
-      "os_trim": "系统级归还内存",
-      "forensic_tensor_refs": "取证 tensor 引用",
-      "forensic_executor": "取证执行器",
-      "forensic_models": "取证模型",
-      "forensic_subprocess": "取证子进程",
-      "forensic_threads": "取证线程",
-      "forensic_gc_garbage": "取证 GC 垃圾"
-    }
-  },
-  "DeepRAMCleanNode": {
-    "title": "分段深度 RAM 清理器",
-    "description": "内置分段深度 RAM 清理器的兼容类名。"
   }
 }

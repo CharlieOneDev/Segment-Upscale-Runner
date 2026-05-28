@@ -20,8 +20,8 @@
         "tooltip": "Segment number to start from. Use this for manual resume."
       },
       "overlap_frames": {
-        "name": "Overlap Frames",
-        "tooltip": "Input context frames reused from the previous segment. Later segments will trim the generated overlap with SegmentFrameTrimmer."
+        "name": "Model Context Overlap",
+        "tooltip": "Input frames read from the previous segment as temporal context for upscale/denoise models."
       },
       "execute": {
         "name": "Execute",
@@ -36,36 +36,28 @@
         "tooltip": "Node ID of VHS_VideoCombine."
       },
       "trimmer_node_id": {
-        "name": "Trimmer Node ID",
-        "tooltip": "Node ID of SegmentFrameTrimmer. Required when overlap_frames is greater than 0."
+        "name": "Final Dedup Trimmer ID",
+        "tooltip": "Node ID of SegmentFrameTrimmer. Place it after RIFE/VFI and before VHS_VideoCombine."
+      },
+      "bridge_trimmer_node_id": {
+        "name": "Pre-VFI Bridge Trimmer ID",
+        "tooltip": "Node ID of SegmentVfiBridgeTrimmer. Place it after upscale/denoise and before RIFE/VFI to avoid interpolating the full overlap."
+      },
+      "vfi_bridge_frames": {
+        "name": "VFI Bridge Frames",
+        "tooltip": "How many previous-tail frames to keep before RIFE/VFI. Use 1 for most interpolation workflows; try 2 if boundaries wobble."
       },
       "trim_multiplier_override": {
-        "name": "Trim Multiplier Override",
-        "tooltip": "0 = auto-detect RIFE/VFI multiplier upstream of the trimmer. Set 2, 4, etc. if auto detection fails."
-      },
-      "cleanup_between_segments": {
-        "name": "Cleanup Between Segments",
-        "tooltip": "Clear ComfyUI execution cache, CUDA cache, and Python GC after each segment."
-      },
-      "deep_cleanup_between_segments": {
-        "name": "Deep Cleanup",
-        "tooltip": "Call the built-in SegmentDeepRAMCleanNode cleanup core after each segment."
+        "name": "Interpolation Output Multiplier",
+        "tooltip": "0 = auto-detect the RIFE/VFI multiplier upstream of the final trimmer. Set 2, 4, etc. if auto detection fails."
       },
       "prune_cleanup_debug_nodes": {
-        "name": "Prune Debug Branches",
-        "tooltip": "Remove cleanup, debug, preview, and temporary save branches from each child prompt."
-      },
-      "cleanup_node_selectors": {
-        "name": "Cleanup Node Selectors",
-        "tooltip": "Comma-separated node IDs or class types to remove from child prompts."
+        "name": "Skip Preview/Debug Branches",
+        "tooltip": "Skip preview, show, debug, and old cleanup branches in each child prompt. This is not memory cleanup."
       },
       "clear_segment_history": {
         "name": "Clear Segment History",
         "tooltip": "Delete each completed child prompt from ComfyUI history after recording its output path."
-      },
-      "unload_models_between_segments": {
-        "name": "Unload Models Between Segments",
-        "tooltip": "More aggressive cleanup. Frees more memory, but the next segment must reload models."
       },
       "merge_segments": {
         "name": "Merge Segments",
@@ -102,23 +94,52 @@
       "audio_mode": {
         "name": "Audio Mode",
         "tooltip": "keep_original = keep current audio wiring; segment_from_loadvideo = cut audio from source video per segment; disable_audio = remove audio."
+      },
+      "segment_io_mode": {
+        "name": "Segment Input Mode",
+        "tooltip": "frame_window = default skip/cap mode; physical_slices = first cut the source into small input videos, then process one file per segment."
+      },
+      "physical_slice_subdir": {
+        "name": "Physical Slice Folder",
+        "tooltip": "Source slices go to input/folder/timestamp/source, and results go to output/folder/timestamp/results."
+      },
+      "physical_slice_crf": {
+        "name": "Slice CRF",
+        "tooltip": "H.264 CRF for intermediate slice videos. 12 is high quality; 0 is near-lossless but very large."
+      },
+      "reuse_physical_slices": {
+        "name": "Reuse Slices",
+        "tooltip": "Reuse existing source slices when resuming the same timestamp."
       }
     }
   },
   "SegmentFrameTrimmer": {
-    "display_name": "Segment Frame Trimmer",
-    "description": "Trim overlap frames from the beginning of a segment before saving.",
+    "display_name": "Final Dedup Frame Trimmer",
+    "description": "Trim duplicate bridge frames before saving. SegmentUpscaleRunner controls it automatically.",
     "inputs": {
       "images": {
         "name": "Images"
       },
       "trim_frames": {
-        "name": "Trim Frames",
-        "tooltip": "Number of frames to trim from the beginning. SegmentUpscaleRunner writes this automatically."
+        "name": "Auto Output Trim Frames",
+        "tooltip": "Written automatically by SegmentUpscaleRunner. Do not edit manually in normal use."
       },
-      "clone_output": {
-        "name": "Clone Output",
-        "tooltip": "Advanced. Clone the trimmed result to detach from the original large tensor. Uses more temporary RAM."
+      "tail_trim_frames": {
+        "name": "Auto Tail Trim Frames",
+        "tooltip": "Written automatically by SegmentUpscaleRunner to remove duplicate VFI padding at segment tails."
+      }
+    }
+  },
+  "SegmentVfiBridgeTrimmer": {
+    "display_name": "Pre-VFI Bridge Trimmer",
+    "description": "Place after upscale/denoise and before RIFE/VFI. It keeps only the bridge frames needed for interpolation.",
+    "inputs": {
+      "images": {
+        "name": "Images"
+      },
+      "trim_frames": {
+        "name": "Auto Context Trim Frames",
+        "tooltip": "Written automatically by SegmentUpscaleRunner. Do not edit manually in normal use."
       }
     }
   },
@@ -139,27 +160,5 @@
         "tooltip": "Clear this runner log after reading. Empty runner_node_id will not clear all logs."
       }
     }
-  },
-  "SegmentDeepRAMCleanNode": {
-    "display_name": "Segment Deep RAM Cleaner",
-    "description": "Built-in deep RAM forensic and cleanup node for Segment Upscale Runner.",
-    "inputs": {
-      "wait_ffmpeg_subprocess": {"name": "Wait For ffmpeg"},
-      "clear_executor_cache": {"name": "Clear Executor Cache"},
-      "clear_cell_refs": {"name": "Clear Cell References"},
-      "clear_model_cpu_cache": {"name": "Clear Model CPU Cache"},
-      "os_trim": {"name": "OS Trim"},
-      "forensic_tensor_refs": {"name": "Forensic Tensor References"},
-      "forensic_executor": {"name": "Forensic Executor"},
-      "forensic_models": {"name": "Forensic Models"},
-      "forensic_subprocess": {"name": "Forensic Subprocesses"},
-      "forensic_threads": {"name": "Forensic Threads"},
-      "forensic_gc_garbage": {"name": "Forensic GC Garbage"},
-      "any_input": {"name": "Any Input"}
-    }
-  },
-  "DeepRAMCleanNode": {
-    "display_name": "Segment Deep RAM Cleaner",
-    "description": "Compatibility alias for the built-in Segment Deep RAM Cleaner."
   }
 }

@@ -3,8 +3,9 @@ ComfyUI 通用视频分段加工队列节点 (Segment Upscale Runner)
 - 将大视频拆成多个连续片段，逐段提交到任意自定义 IMAGE/video 工作流
 - 每段独立保存为单独视频，可选自动合并
 - 支持断点续跑
-- 支持重叠帧（Overlap Frames）：用前一段尾部 N 帧作为下一段头部的时序上下文，
-  保存时由 SegmentFrameTrimmer 节点自动裁掉，合并后无重叠、无跳帧
+- 支持模型上下文重叠帧：用前一段尾部 N 帧作为下一段时序上下文
+- 支持 VFI 前桥接裁剪：只把少量桥接帧送入插帧节点，减少重复插帧内存
+- 保存时由 SegmentFrameTrimmer 节点自动去重，合并后无重叠、无跳帧
 """
 
 import copy, ctypes, gc, hashlib, json, time, os, platform, shutil, subprocess, sys, tempfile, threading, traceback, urllib.request, urllib.error
@@ -518,6 +519,24 @@ def _output_trim_for_overlap(input_overlap: int, trim_multiplier: int) -> int:
     return (input_overlap - 1) * trim_multiplier + 1
 
 
+def _output_tail_trim_for_segment(has_overlap: bool, is_last_segment: bool, trim_multiplier: int) -> int:
+    trim_multiplier = max(1, int(trim_multiplier or 1))
+    if not has_overlap or is_last_segment or trim_multiplier <= 1:
+        return 0
+    return trim_multiplier - 1
+
+
+def _bridge_plan(input_overlap: int, bridge_frames: int, bridge_enabled: bool) -> tuple[int, int, int]:
+    """Return (pre_vfi_trim, vfi_input_overlap, final_output_trim_input)."""
+    input_overlap = max(0, int(input_overlap or 0))
+    if not bridge_enabled or input_overlap <= 0:
+        return 0, input_overlap, input_overlap
+    bridge_frames = max(1, int(bridge_frames or 1))
+    kept_overlap = min(input_overlap, bridge_frames)
+    pre_vfi_trim = input_overlap - kept_overlap
+    return pre_vfi_trim, kept_overlap, kept_overlap
+
+
 def _node_references_any(node: dict, removed_ids: set[str]) -> bool:
     for value in _node_inputs(node).values():
         src_id = _link_node_id(value)
@@ -559,8 +578,8 @@ def _matches_selector(nid: str, node: dict, selectors: set[str]) -> bool:
 def _prune_in_graph_cleanup_branch(prompt: dict, selectors: set[str] | None = None) -> tuple[list[str], list[str]]:
     """
     DeepRAMCleanNode 若接 IMAGE，会在 prompt 执行中持有大 tensor。
-    Runner 会在每段 prompt 完成后再调用清理，所以子 prompt 中只移除
-    已选择的清理/调试节点以及它们下游的 show/debug 分支。
+    Runner 不再把深度内存清理作为默认段后动作；这里只移除已选择的
+    清理/调试节点以及它们下游的 show/debug 分支，避免子 prompt 多做旁路计算。
     """
     if not isinstance(prompt, dict):
         return [], []
@@ -758,6 +777,147 @@ def _sur_set_load_video_segment(
         log("  ⚠ LoadVideo 未声明 skip_first_frames/start_time，已尝试写入 skip_first_frames")
 
 
+def _sur_clean_rel_dir(text: str, default: str = "SUR_physical_segments") -> str:
+    raw = str(text or "").strip().replace("\\", "/").strip("/")
+    if not raw:
+        raw = default
+    parts = []
+    for part in raw.split("/"):
+        part = part.strip().strip(".")
+        if not part or part in (".", ".."):
+            continue
+        safe = "".join(ch if ch not in '<>:"|?*' else "_" for ch in part)
+        if safe:
+            parts.append(safe[:80])
+    return "/".join(parts) or default
+
+
+def _sur_input_rel_path(path: str) -> str:
+    input_root = os.path.realpath(folder_paths.get_input_directory())
+    real = os.path.realpath(path)
+    try:
+        rel = os.path.relpath(real, input_root)
+    except Exception:
+        return real
+    return rel.replace("\\", "/")
+
+
+def _sur_ffmpeg_float(value: float) -> str:
+    text = f"{float(value):.6f}".rstrip("0").rstrip(".")
+    return text or "0"
+
+
+def _sur_slice_video_by_frames(
+    src_path: str,
+    out_path: str,
+    start_frame: int,
+    frame_count: int,
+    frame_rate: float,
+    crf: int = 12,
+    reuse_existing: bool = True,
+    log=None,
+) -> bool:
+    start_frame = max(0, int(start_frame or 0))
+    frame_count = max(1, int(frame_count or 1))
+    end_frame = start_frame + frame_count
+    if reuse_existing and os.path.isfile(out_path) and os.path.getsize(out_path) > 0:
+        if log:
+            log(f"  分片已存在，复用: {_sur_input_rel_path(out_path)}")
+        return True
+
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    ffmpeg = shutil.which("ffmpeg") or "ffmpeg"
+    vf = f"trim=start_frame={start_frame}:end_frame={end_frame},setpts=PTS-STARTPTS"
+    cmd = [
+        ffmpeg, "-y", "-v", "error",
+        "-i", src_path,
+        "-vf", vf,
+        "-an",
+        "-c:v", "libx264",
+        "-preset", "veryfast",
+        "-crf", str(max(0, min(51, int(crf or 0)))),
+        "-pix_fmt", "yuv420p",
+    ]
+    if frame_rate and frame_rate > 0:
+        cmd += ["-r", _sur_ffmpeg_float(frame_rate)]
+    cmd += ["-movflags", "+faststart", out_path]
+
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        if log:
+            err = (result.stderr or result.stdout or "").strip()
+            log(f"  ✗ ffmpeg 分片失败: {err[-500:]}")
+        return False
+    return os.path.isfile(out_path) and os.path.getsize(out_path) > 0
+
+
+def _sur_prepare_physical_slices(
+    src_path: str,
+    seg_list: list[tuple[int, int, int]],
+    run_stamp: str,
+    subdir: str,
+    base_frame_offset: int,
+    frame_rate: float,
+    crf: int,
+    reuse_existing: bool,
+    log=None,
+) -> dict[int, dict[str, str]]:
+    src_real = _sur_resolve_media_path(src_path) or os.path.realpath(str(src_path))
+    if not os.path.isfile(src_real):
+        raise FileNotFoundError(src_path)
+
+    input_root = folder_paths.get_input_directory()
+    safe_subdir = _sur_clean_rel_dir(subdir)
+    slice_dir = os.path.join(input_root, safe_subdir, run_stamp, "source")
+    os.makedirs(slice_dir, exist_ok=True)
+
+    result: dict[int, dict[str, str]] = {}
+    if log:
+        log(f"物理分片模式=开  源: {os.path.basename(src_real)}")
+        log(f"分片目录: input/{safe_subdir}/{run_stamp}/source")
+
+    for idx, (load_skip, load_limit, _trim) in enumerate(seg_list, start=1):
+        start_frame = max(0, int(base_frame_offset) + int(load_skip))
+        name = f"seg{idx:03d}_f{start_frame:06d}_n{int(load_limit):04d}.mp4"
+        out_path = os.path.join(slice_dir, name)
+        if log:
+            log(f"  切片 第{idx}/{len(seg_list)}段: start={start_frame} frames={load_limit}")
+        ok = _sur_slice_video_by_frames(
+            src_real, out_path, start_frame, load_limit, frame_rate,
+            crf=crf, reuse_existing=reuse_existing, log=log
+        )
+        if not ok:
+            raise RuntimeError(f"切片失败: {name}")
+        result[idx] = {
+            "abs": os.path.realpath(out_path),
+            "rel": _sur_input_rel_path(out_path),
+        }
+    return result
+
+
+def _sur_set_load_video_file_segment(
+    wf: dict,
+    load_nid: str,
+    video_abs: str,
+    video_rel: str,
+    load_limit: int,
+    log=None,
+):
+    node = wf.get(str(load_nid))
+    if not node:
+        return
+    inputs = node.setdefault("inputs", {})
+    class_type = _node_class(node)
+    inputs["video"] = os.path.realpath(video_abs) if "Path" in class_type else video_rel
+    inputs["frame_load_cap"] = int(load_limit)
+    if "skip_first_frames" in inputs:
+        inputs["skip_first_frames"] = 0
+    if "start_time" in inputs or "FFmpeg" in class_type:
+        inputs["start_time"] = 0.0
+    if log:
+        log(f"  LoadVideo: video={video_rel} skip=0 frame_load_cap={load_limit}")
+
+
 def _sur_set_segment_audio(
     wf: dict,
     combine_nid: str,
@@ -819,65 +979,6 @@ def _sur_bool(value, default: bool = False) -> bool:
     if text in ("0", "false", "no", "off", "关", "否", ""):
         return False
     return default
-
-
-def _sur_repair_legacy_widget_shift(
-    clear_segment_history,
-    unload_models_between_segments,
-    merge_segments,
-    merged_filename_prefix,
-    enable_checkpoint,
-    auto_resume_checkpoint,
-    clear_checkpoint_on_finish,
-    pre_segment_paths,
-    reference_image_node_id,
-    segment_reference_images,
-    audio_mode,
-):
-    shifted = (
-        isinstance(unload_models_between_segments, str)
-        and not isinstance(merged_filename_prefix, str)
-    )
-    if not shifted:
-        return (
-            clear_segment_history,
-            unload_models_between_segments,
-            merge_segments,
-            merged_filename_prefix,
-            enable_checkpoint,
-            auto_resume_checkpoint,
-            clear_checkpoint_on_finish,
-            pre_segment_paths,
-            reference_image_node_id,
-            segment_reference_images,
-            audio_mode,
-            False,
-        )
-
-    old_merge_segments = clear_segment_history
-    old_merged_filename_prefix = unload_models_between_segments
-    old_enable_checkpoint = merge_segments
-    old_auto_resume_checkpoint = merged_filename_prefix
-    old_clear_checkpoint_on_finish = enable_checkpoint
-    old_pre_segment_paths = auto_resume_checkpoint
-    old_reference_image_node_id = clear_checkpoint_on_finish
-    old_segment_reference_images = pre_segment_paths
-    old_audio_mode = reference_image_node_id
-
-    return (
-        True,
-        False,
-        old_merge_segments,
-        old_merged_filename_prefix,
-        old_enable_checkpoint,
-        old_auto_resume_checkpoint,
-        old_clear_checkpoint_on_finish,
-        old_pre_segment_paths,
-        old_reference_image_node_id,
-        old_segment_reference_images,
-        old_audio_mode or audio_mode,
-        True,
-    )
 
 
 def _sur_set_segment_reference_image(
@@ -1659,98 +1760,49 @@ def _clear_comfy_execution_cache(log=None, reset_executors: bool = True):
     return cleared_entries
 
 
-def _run_post_segment_clean(log, deep: bool = True, unload_models: bool = False):
-    before_ram = _sur_ram_gb()
-    before_vram = _sur_vram_gb()
-    if log:
-        log(f"  段后清理开始: RAM={before_ram:.2f}GB VRAM={before_vram:.2f}GB")
-    if unload_models:
-        try:
-            from comfy import model_management as _mm
-            _mm.unload_all_models()
-            log("  模型卸载: 已请求 unload_all_models")
-        except Exception as e:
-            log(f"  模型卸载失败: {type(e).__name__}: {e}")
-
-    if not deep:
-        _clear_comfy_execution_cache(log=log)
-        after_ram = _sur_ram_gb()
-        after_vram = _sur_vram_gb()
-        if log:
-            log(
-                f"  段后清理结束: RAM={after_ram:.2f}GB VRAM={after_vram:.2f}GB "
-                f"(ΔRAM={after_ram - before_ram:+.2f}GB ΔVRAM={after_vram - before_vram:+.2f}GB)"
-            )
-        return
-    try:
-        cleaner = SegmentDeepRAMCleanNode()
-        _, report = cleaner.deep_clean(
-            wait_ffmpeg_subprocess=True,
-            clear_executor_cache=True,
-            clear_cell_refs=True,
-            clear_model_cpu_cache=True,
-            os_trim=True,
-            forensic_tensor_refs=False,
-            forensic_executor=False,
-            forensic_models=False,
-            forensic_subprocess=False,
-            forensic_threads=False,
-            forensic_gc_garbage=False,
-            aggressive_video_tensor_cleanup=True,
-            any_input=None,
-        )
-        summary = [
-            line.strip()
-            for line in str(report).splitlines()
-            if line.startswith("RAM:") or line.startswith("VRAM:")
-        ]
-        log("  深度段后清理完成" + (": " + " / ".join(summary) if summary else ""))
-    except Exception as e:
-        log(f"  深度段后清理失败: {type(e).__name__}: {e}")
-    finally:
-        _clear_comfy_execution_cache(log=log)
-        after_ram = _sur_ram_gb()
-        after_vram = _sur_vram_gb()
-        if log:
-            log(
-                f"  段后清理结束: RAM={after_ram:.2f}GB VRAM={after_vram:.2f}GB "
-                f"(ΔRAM={after_ram - before_ram:+.2f}GB ΔVRAM={after_vram - before_vram:+.2f}GB)"
-            )
-
-
 # ── 工具函数 ──────────────────────────────────────────────────────
 
 def _now_stamp() -> str:
     return time.strftime("%Y%m%d_%H%M%S")
 
 def _build_plan_text(total_frames, segments, start_from,
-                     overlap, load_nid, trimmer_nid,
-                     trim_multiplier: int = 1, trim_note: str = "") -> str:
+                     overlap, load_nid, trimmer_nid, bridge_trimmer_nid,
+                     vfi_bridge_frames: int = 1,
+                     trim_multiplier: int = 1, trim_note: str = "",
+                     segment_io_mode: str = "frame_window",
+                     physical_slice_subdir: str = "SUR_physical_segments") -> str:
     if total_frames <= 0:
         return "✗ total_frames 必须大于 0"
 
     seg_list = calc_segments(total_frames, segments, overlap)
+    bridge_enabled = bool(bridge_trimmer_nid and overlap > 0)
     lines = [
         f"LoadVideo 节点 ID : {load_nid}",
-        f"Trimmer  节点 ID  : {trimmer_nid or '（未设置，overlap_frames 将被忽略）'}",
-        f"总帧数: {total_frames}  共 {segments} 段  重叠帧: {overlap}  从第 {start_from} 段开始",
-        f"Trimmer 输出裁剪倍率: x{trim_multiplier}"
+        f"最终裁帧节点 ID : {trimmer_nid or '（未设置，重叠输出不会自动去重）'}",
+        f"VFI 前桥接节点 ID: {bridge_trimmer_nid or '（未设置，兼容旧模式：重叠帧会进入 VFI）'}",
+        f"总帧数: {total_frames}  共 {segments} 段  模型上下文重叠: {overlap} 帧  从第 {start_from} 段开始",
+        f"VFI 桥接帧: {vfi_bridge_frames if bridge_enabled else '未启用'}",
+        f"插帧输出倍率: x{trim_multiplier}"
         + (f"（{trim_note}）" if trim_note else ""),
+        f"分段输入模式: {segment_io_mode}"
+        + (f"  input/output 子目录: {physical_slice_subdir}" if segment_io_mode == "physical_slices" else ""),
         "",
-        f"  {'段':>3}  {'load_skip':>9}  {'load_limit':>10}  {'trim_in':>7}  {'trim_out':>8}"
+        f"  {'段':>3}  {'load_skip':>9}  {'load_limit':>10}  {'ctx':>5}  {'pre_vfi':>7}  {'head_trim':>9}  {'tail_trim':>9}"
         f"  {'保存范围':>14}  {'保存帧数':>8}  状态",
-        f"  {'-'*3}  {'-'*9}  {'-'*10}  {'-'*7}  {'-'*8}  {'-'*14}  {'-'*8}  ----",
+        f"  {'-'*3}  {'-'*9}  {'-'*10}  {'-'*5}  {'-'*7}  {'-'*9}  {'-'*9}  {'-'*14}  {'-'*8}  ----",
     ]
     for i, (skip, limit, trim) in enumerate(seg_list):
         seg_num     = i + 1
         saved_start = skip + trim
         saved_end   = skip + limit - 1
         saved_n     = limit - trim
-        out_trim    = _output_trim_for_overlap(trim, trim_multiplier)
+        pre_vfi_trim, _, final_trim_input = _bridge_plan(trim, vfi_bridge_frames, bridge_enabled)
+        out_trim    = _output_trim_for_overlap(final_trim_input, trim_multiplier)
+        tail_trim   = _output_tail_trim_for_segment(overlap > 0, seg_num == len(seg_list), trim_multiplier)
         status      = "→ 执行" if seg_num >= start_from else "  跳过"
         lines.append(
             f"  第{seg_num:>2}段  skip={skip:>7}  limit={limit:>8}"
-            f"  trim_in={trim:>3}  trim_out={out_trim:>3}"
+            f"  ctx={trim:>3}  pre={pre_vfi_trim:>3}  head={out_trim:>3}  tail={tail_trim:>3}"
             f"  [{saved_start:>5} ~ {saved_end:>5}]  {saved_n:>6}帧  {status}"
         )
     speed = _sur_load_speed_record()
@@ -1767,239 +1819,14 @@ def _build_plan_text(total_frames, segments, start_from,
     return "\n".join(lines)
 
 
-# ── 内置 RAM 深度清理节点 ─────────────────────────────────────────
-
-class SegmentDeepRAMCleanNode:
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "wait_ffmpeg_subprocess": (
-                    "BOOLEAN",
-                    {
-                        "default": True,
-                        "tooltip": "等待 ffmpeg 子进程结束。Windows + VHS/VideoCombine 场景建议保持开启。",
-                    },
-                ),
-                "clear_executor_cache": (
-                    "BOOLEAN",
-                    {"default": True, "tooltip": "深度清理 ComfyUI executor/caches 中的输出 tensor。"},
-                ),
-                "clear_cell_refs": (
-                    "BOOLEAN",
-                    {"default": True, "tooltip": "清理闭包 cell 中直接持有的大 CPU tensor。"},
-                ),
-                "clear_model_cpu_cache": (
-                    "BOOLEAN",
-                    {"default": True, "tooltip": "请求 ComfyUI model_management 释放模型缓存。"},
-                ),
-                "os_trim": (
-                    "BOOLEAN",
-                    {"default": True, "tooltip": "Windows 调 EmptyWorkingSet，Linux 调 malloc_trim。"},
-                ),
-                "forensic_tensor_refs": (
-                    "BOOLEAN",
-                    {"default": True, "tooltip": "输出大 CPU tensor 的直接引用者。日志会比较长。"},
-                ),
-                "forensic_executor": (
-                    "BOOLEAN",
-                    {"default": True, "tooltip": "分析 ComfyUI executor/cache 中的 tensor 占用。"},
-                ),
-                "forensic_models": (
-                    "BOOLEAN",
-                    {"default": True, "tooltip": "分析 comfy.model_management 当前加载模型。"},
-                ),
-                "forensic_subprocess": (
-                    "BOOLEAN",
-                    {"default": True, "tooltip": "分析当前 ComfyUI 子进程，尤其是 ffmpeg。"},
-                ),
-                "forensic_threads": (
-                    "BOOLEAN",
-                    {"default": True, "tooltip": "分析当前线程栈。"},
-                ),
-                "forensic_gc_garbage": (
-                    "BOOLEAN",
-                    {"default": True, "tooltip": "检查 gc.garbage。"},
-                ),
-            },
-            "optional": {
-                "any_input": ("*", {}),
-            },
-        }
-
-    RETURN_TYPES = ("*", "STRING")
-    RETURN_NAMES = ("passthrough", "report")
-    FUNCTION = "deep_clean"
-    CATEGORY = "video/utils"
-    OUTPUT_NODE = True
-
-    def deep_clean(
-        self,
-        wait_ffmpeg_subprocess=True,
-        clear_executor_cache=True,
-        clear_cell_refs=True,
-        clear_model_cpu_cache=True,
-        os_trim=True,
-        forensic_tensor_refs=True,
-        forensic_executor=True,
-        forensic_models=True,
-        forensic_subprocess=True,
-        forensic_threads=True,
-        forensic_gc_garbage=True,
-        aggressive_video_tensor_cleanup=False,
-        any_input=None,
-    ):
-        input_was_connected = any_input is not None
-        any_input = None
-
-        torch = _sur_import_torch()
-        process = _sur_process()
-        lines = [
-            "=" * 60,
-            "SUR 内置 RAM 深度取证+清理报告",
-            f"   OS: {platform.system()}  Python: {sys.version.split()[0]}",
-            "=" * 60,
-        ]
-        if torch is None:
-            lines.append("提示: torch 不可用，tensor/VRAM 相关清理会跳过。")
-        if process is None:
-            lines.append("提示: psutil 不可用，进程/子进程 RAM 统计会跳过。")
-        if input_was_connected:
-            lines.append(
-                "提示: any_input 已在清理函数开头置空；若它接的是 IMAGE，"
-                "ComfyUI 输入缓存仍可能在本次 prompt 结束前持有大 tensor。"
-            )
-
-        ram0 = _sur_ram_gb(process)
-        vram0 = _sur_vram_gb(torch)
-        lines.append(f"初始: RAM={ram0:.2f}GB  VRAM={vram0:.2f}GB")
-
-        lines.append("\n── 取证（清理前）──")
-        if forensic_threads:
-            lines.append("")
-            _sur_analyze_threads(lines)
-        if forensic_subprocess:
-            lines.append("")
-            _sur_analyze_subprocesses(lines)
-        if forensic_executor:
-            lines.append("")
-            _sur_analyze_executor_cache(lines)
-        if forensic_models:
-            lines.append("")
-            _sur_analyze_models(lines)
-        if forensic_tensor_refs:
-            lines.append("")
-            _sur_trace_tensor_holders(lines)
-        if forensic_gc_garbage:
-            lines.append("")
-            _sur_check_gc_garbage(lines)
-
-        lines.append(f"\n取证结束: RAM={_sur_ram_gb(process):.2f}GB")
-        lines.append("\n── 清理 ──")
-
-        if wait_ffmpeg_subprocess:
-            lines.append("\n[0a] 等待 ffmpeg 子进程...")
-            _sur_wait_for_ffmpeg_subprocesses(lines)
-
-        lines.append("\n[0b] 等待 VHS/编码线程...")
-        _sur_wait_for_vhs_threads(lines)
-
-        c1 = gc.collect()
-        gc.collect()
-        lines.append(f"\n[1] GC 第一轮: 回收 {c1} 个  RAM={_sur_ram_gb(process):.2f}GB")
-
-        if clear_executor_cache:
-            r0 = _sur_ram_gb(process)
-            lines.append("\n[2] executor/cache 深度清理...")
-            executors = _sur_get_prompt_executors()
-            if executors:
-                total_tensors = 0
-                for executor, source in executors:
-                    total_tensors += _sur_deep_clear_executor(executor, source, torch, lines)
-                lines.append(f"  合计 resize tensor: {total_tensors} 个")
-            else:
-                lines.append("  ✗ executor 未找到")
-            gc.collect()
-            gc.collect()
-            lines.append(f"  清理后释放: {r0 - _sur_ram_gb(process):.2f}GB  RAM={_sur_ram_gb(process):.2f}GB")
-
-        if clear_cell_refs:
-            r0 = _sur_ram_gb(process)
-            lines.append("\n[3] cell 闭包引用清理...")
-            _sur_clear_cell_tensor_refs(lines)
-            gc.collect()
-            gc.collect()
-            lines.append(f"  清理后释放: {r0 - _sur_ram_gb(process):.2f}GB  RAM={_sur_ram_gb(process):.2f}GB")
-
-        if aggressive_video_tensor_cleanup:
-            r0 = _sur_ram_gb(process)
-            lines.append("\n[3b] 残留 IMAGE/VIDEO tensor 强清理...")
-            _sur_aggressive_clear_video_tensors(lines)
-            gc.collect()
-            gc.collect()
-            lines.append(f"  清理后释放: {r0 - _sur_ram_gb(process):.2f}GB  RAM={_sur_ram_gb(process):.2f}GB")
-
-        if clear_model_cpu_cache:
-            r0 = _sur_ram_gb(process)
-            try:
-                import comfy.model_management as mm
-                mm.free_memory(1024**4, mm.get_torch_device())
-                gc.collect()
-                lines.append(f"\n[4] ComfyUI 模型缓存: 释放 {r0 - _sur_ram_gb(process):.2f}GB  RAM={_sur_ram_gb(process):.2f}GB")
-            except Exception as e:
-                lines.append(f"\n[4] ComfyUI 模型缓存: 失败 ({type(e).__name__}: {e})")
-
-        if torch is not None:
-            try:
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-                    torch.cuda.ipc_collect()
-                    torch.cuda.synchronize()
-                    lines.append("\n[5] CUDA: empty_cache + ipc_collect + synchronize ✓")
-            except Exception as e:
-                lines.append(f"\n[5] CUDA 清理失败: {type(e).__name__}: {e}")
-
-        c2 = gc.collect()
-        gc.collect()
-        gc.collect()
-        lines.append(f"\n[6] GC 第二轮: 回收 {c2} 个  RAM={_sur_ram_gb(process):.2f}GB")
-
-        if os_trim:
-            r0 = _sur_ram_gb(process)
-            ok = _sur_trim_ram_os()
-            name = "Windows EmptyWorkingSet" if platform.system() == "Windows" else "malloc_trim"
-            lines.append(f"\n[7] {name}: {'✓' if ok else '✗'}  释放 {r0 - _sur_ram_gb(process):.2f}GB  RAM={_sur_ram_gb(process):.2f}GB")
-
-        lines.append("\n── 清理后验证 ──")
-        if forensic_tensor_refs:
-            lines.append("")
-            _sur_trace_tensor_holders(lines, max_tensors=5)
-        if forensic_subprocess:
-            lines.append("")
-            _sur_analyze_subprocesses(lines)
-
-        ram1 = _sur_ram_gb(process)
-        vram1 = _sur_vram_gb(torch)
-        lines.append("\n" + "=" * 60)
-        lines.append(f"RAM:  {ram0:.2f}GB -> {ram1:.2f}GB  (释放 {ram0 - ram1:.2f}GB)")
-        lines.append(f"VRAM: {vram0:.2f}GB -> {vram1:.2f}GB  (释放 {vram0 - vram1:.2f}GB)")
-        if ram0 - ram1 < 0.1:
-            lines.append("⚠ RAM 几乎未释放：请重点检查 tensor 引用链、未结束的 ffmpeg、以及仍在图内执行的预览/保存分支。")
-        lines.append("=" * 60)
-
-        report = "\n".join(lines)
-        print(report)
-        return (None, report)
-
-
 # ── SegmentFrameTrimmer 节点 ──────────────────────────────────────
 
 class SegmentFrameTrimmer:
     """
-    插在放大节点输出 和 VHS_VideoCombine 之间。
+    插在最终 IMAGE 输出 和 VHS_VideoCombine 之间。
     SegmentUpscaleRunner 每段执行时会自动设置 trim_frames：
       - 第1段：trim_frames = 0（直通）
-      - 后续段：裁掉头部重叠上下文对应的输出帧
+      - 后续段：裁掉头部桥接帧对应的输出帧
         （若本节点放在 RIFE/VFI 后，Runner 会自动换算插帧倍率）
     这样每段保存的内容严格连续，合并视频时不会出现重复帧或跳帧。
     """
@@ -2017,42 +1844,78 @@ class SegmentFrameTrimmer:
                     "INT",
                     {
                         "default": 0, "min": 0, "max": 256, "step": 1,
-                        "tooltip": "从帧序列头部裁掉的帧数，由 SegmentUpscaleRunner 自动控制。",
+                        "tooltip": (
+                            "自动参数。Runner 会写入最终保存前需要裁掉的输出帧数；"
+                            "普通使用不要手动修改。"
+                        ),
                     },
                 ),
-                "clone_output": (
-                    "BOOLEAN",
+                "tail_trim_frames": (
+                    "INT",
                     {
-                        "default": False,
+                        "default": 0, "min": 0, "max": 256, "step": 1,
                         "tooltip": (
-                            "高级选项。开启后会复制裁剪后的输出，避免 PyTorch 切片视图继续引用原始大张量；"
-                            "但会在保存前临时增加 RAM 占用。"
+                            "自动参数。Runner 会写入最终保存前需要从尾部裁掉的输出帧数；"
+                            "普通使用不要手动修改。"
                         ),
                     },
                 ),
             }
         }
 
-    def trim(self, images, trim_frames: int, clone_output=False):
+    def trim(self, images, trim_frames: int, tail_trim_frames: int = 0):
         if images is None:
             raise ValueError(
                 "[SegmentFrameTrimmer] images 为 None，"
                 "请将本节点的 images 输入直接连接到上游放大/插帧节点，"
                 "不要经过类型为 * 的透传节点中转。"
             )
-        n           = images.shape[0]
+        n = images.shape[0]
+        head = max(0, min(int(trim_frames), n - 1))
+        tail = max(0, int(tail_trim_frames or 0))
+        tail = min(tail, max(0, n - head - 1))
+        end = n - tail if tail > 0 else n
+        return (images[head:end],)
+
+
+class SegmentVfiBridgeTrimmer:
+    """
+    放在高清放大/去噪等时序上下文节点之后、RIFE/VFI 之前。
+    Runner 会在第2段起裁掉多余的上下文帧，只保留少量桥接帧给 VFI 生成段间过渡。
+    """
+    CATEGORY    = "video/utils"
+    FUNCTION    = "trim"
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("images",)
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "images": ("IMAGE",),
+                "trim_frames": (
+                    "INT",
+                    {
+                        "default": 0, "min": 0, "max": 256, "step": 1,
+                        "tooltip": (
+                            "自动参数。Runner 会写入 VFI/RIFE 前要裁掉的上下文帧数；"
+                            "普通使用不要手动修改。"
+                        ),
+                    },
+                ),
+            }
+        }
+
+    def trim(self, images, trim_frames: int):
+        if images is None:
+            raise ValueError(
+                "[SegmentVfiBridgeTrimmer] images 为 None，"
+                "请把本节点放在放大/去噪输出之后、RIFE/VFI 之前。"
+            )
+        n = images.shape[0]
         trim_frames = max(0, min(int(trim_frames), n - 1))
         if trim_frames > 0:
-            if clone_output:
-                out = images[trim_frames:].clone()
-                _sur_zero_tensor_storage(images)
-            else:
-                out = images[trim_frames:]
-            return (out,)
-        if clone_output:
-            out = images.clone()
-            _sur_zero_tensor_storage(images)
-            return (out,)
+            return (images[trim_frames:],)
         return (images,)
 
 
@@ -2162,10 +2025,9 @@ class SegmentUpscaleRunner:
                         "default": 0, "min": 0, "max": 64, "step": 1,
                         "display": "slider",
                         "tooltip": (
-                            "重叠帧数（建议 4~16，0=不重叠）。\n"
-                            "第2段起会向前多读这些帧作为模型时序上下文，\n"
-                            "保存时由 SegmentFrameTrimmer 自动裁掉。\n"
-                            "启用时必须填写 trimmer_node_id。"
+                            "模型上下文重叠帧数（建议 4~16，0=不重叠）。\n"
+                            "第2段起会向前多读这些帧给放大/去噪等时序模型参考；\n"
+                            "如接了 VFI 前桥接裁剪，重叠区不会整段进入 RIFE/VFI。"
                         ),
                     },
                 ),
@@ -2195,10 +2057,26 @@ class SegmentUpscaleRunner:
                     {
                         "default": "",
                         "tooltip": (
-                            "SegmentFrameTrimmer 节点 ID。\n"
-                            "overlap_frames=0 时可留空；\n"
-                            "overlap_frames>0 时必须填写。"
+                            "最终 SegmentFrameTrimmer 节点 ID。\n"
+                            "把它放在 RIFE/VFI 之后、VHS_VideoCombine 之前，Runner 会自动写入最终去重帧数。"
                         ),
+                    },
+                ),
+                "bridge_trimmer_node_id": (
+                    "STRING",
+                    {
+                        "default": "",
+                        "tooltip": (
+                            "可选但强烈推荐。SegmentVfiBridgeTrimmer 节点 ID。\n"
+                            "把它放在放大/去噪之后、RIFE/VFI 之前，避免把整个重叠区重复插帧。"
+                        ),
+                    },
+                ),
+                "vfi_bridge_frames": (
+                    "INT",
+                    {
+                        "default": 1, "min": 1, "max": 16, "step": 1,
+                        "tooltip": "进入 RIFE/VFI 前保留多少帧上一段尾部作为桥接。普通插帧建议 1；边界仍抖动可试 2。",
                     },
                 ),
                 "trim_multiplier_override": (
@@ -2206,40 +2084,18 @@ class SegmentUpscaleRunner:
                     {
                         "default": 0, "min": 0, "max": 16, "step": 1,
                         "tooltip": (
-                            "0=自动识别 Trimmer 上游的 RIFE/VFI 倍率。\n"
-                            "如果自动识别失败，可手动填 2/4 等；overlap=8 且倍率=2 时会裁 15 输出帧。"
+                            "插帧输出倍率。0=自动识别最终裁帧节点上游的 RIFE/VFI 倍率。\n"
+                            "自动失败时手动填 2/4 等。"
                         ),
-                    },
-                ),
-                "cleanup_between_segments": (
-                    "BOOLEAN",
-                    {
-                        "default": True,
-                        "tooltip": "每段完成后清理 ComfyUI 执行缓存、CUDA 缓存和 Python GC。",
-                    },
-                ),
-                "deep_cleanup_between_segments": (
-                    "BOOLEAN",
-                    {
-                        "default": True,
-                        "tooltip": "启用时调用本插件内置的 SegmentDeepRAMCleanNode 做更彻底的段后清理。",
                     },
                 ),
                 "prune_cleanup_debug_nodes": (
                     "BOOLEAN",
                     {
                         "default": True,
-                        "tooltip": "从每段子 prompt 中移除清理/调试/预览分支，避免这些节点持有大 IMAGE tensor。",
-                    },
-                ),
-                "cleanup_node_selectors": (
-                    "STRING",
-                    {
-                        "default": "DeepRAMCleanNode,VRAM_Debug,easy showAnything,PreviewImage,SaveImage",
                         "tooltip": (
-                            "要从子 prompt 移除的节点 ID 或 class_type，逗号分隔。\n"
-                            "下游 show/debug/preview 节点会一起移除。\n"
-                            "建议把不需要执行的预览、调试、保存图片节点都加进来。"
+                            "从每段子 prompt 中跳过预览、show、debug、旧清理分支。"
+                            "这不是内存清理，只是避免不必要的旁路节点参与每段执行。"
                         ),
                     },
                 ),
@@ -2248,13 +2104,6 @@ class SegmentUpscaleRunner:
                     {
                         "default": True,
                         "tooltip": "每段成功记录输出路径后删除该子 prompt 的 history，减少长任务中的历史记录内存积压。",
-                    },
-                ),
-                "unload_models_between_segments": (
-                    "BOOLEAN",
-                    {
-                        "default": False,
-                        "tooltip": "更激进的段间清理：每段后卸载模型。能释放更多内存，但下一段会重新加载模型、速度更慢。",
                     },
                 ),
                 "merge_segments": (
@@ -2324,6 +2173,37 @@ class SegmentUpscaleRunner:
                         ),
                     },
                 ),
+                "segment_io_mode": (
+                    ["frame_window", "physical_slices"],
+                    {
+                        "default": "frame_window",
+                        "tooltip": (
+                            "frame_window=默认模式，直接改 LoadVideo 的 skip/cap；\n"
+                            "physical_slices=先把源视频切成小 mp4 放入 input，再逐片执行，适合高清放大+插帧。"
+                        ),
+                    },
+                ),
+                "physical_slice_subdir": (
+                    "STRING",
+                    {
+                        "default": "SUR_physical_segments",
+                        "tooltip": "物理分片专用目录名。源片段写入 input/该目录/时间戳/source，成果写入 output/该目录/时间戳/results。",
+                    },
+                ),
+                "physical_slice_crf": (
+                    "INT",
+                    {
+                        "default": 12, "min": 0, "max": 30, "step": 1,
+                        "tooltip": "切片中间视频的 H.264 CRF。12 质量很高；0=近似无损但文件很大。",
+                    },
+                ),
+                "reuse_physical_slices": (
+                    "BOOLEAN",
+                    {
+                        "default": True,
+                        "tooltip": "同一时间戳续跑时复用已存在的源分片，避免重复切片。",
+                    },
+                ),
             },
             "hidden": {
                 "prompt":       "PROMPT",
@@ -2339,13 +2219,11 @@ class SegmentUpscaleRunner:
         overlap_frames=0, execute=False,
         load_video_node_id="", combine_video_node_id="",
         trimmer_node_id="",
+        bridge_trimmer_node_id="",
+        vfi_bridge_frames=1,
         trim_multiplier_override=0,
-        cleanup_between_segments=True,
-        deep_cleanup_between_segments=True,
         prune_cleanup_debug_nodes=True,
-        cleanup_node_selectors="DeepRAMCleanNode,VRAM_Debug,easy showAnything,PreviewImage,SaveImage",
         clear_segment_history=True,
-        unload_models_between_segments=False,
         merge_segments=True,
         merged_filename_prefix="sur_merged",
         enable_checkpoint=True,
@@ -2355,6 +2233,10 @@ class SegmentUpscaleRunner:
         reference_image_node_id="",
         segment_reference_images="",
         audio_mode="keep_original",
+        segment_io_mode="frame_window",
+        physical_slice_subdir="SUR_physical_segments",
+        physical_slice_crf=12,
+        reuse_physical_slices=True,
         prompt=None, extra_pnginfo=None, unique_id=None,
         **_legacy,
     ):
@@ -2363,43 +2245,27 @@ class SegmentUpscaleRunner:
         segments     = int(segment_count or 4)
         start_from   = max(1, int(start_segment or 1))
         overlap      = max(0, int(overlap_frames or 0))
-        load_nid     = (load_video_node_id or "").strip()
-        combine_nid  = (combine_video_node_id or "").strip()
-        trimmer_nid  = (trimmer_node_id or "").strip()
-        trim_override = max(0, int(trim_multiplier_override or 0))
-        (
-            clear_segment_history,
-            unload_models_between_segments,
-            merge_segments,
-            merged_filename_prefix,
-            enable_checkpoint,
-            auto_resume_checkpoint,
-            clear_checkpoint_on_finish,
-            pre_segment_paths,
-            reference_image_node_id,
-            segment_reference_images,
-            audio_mode,
-            legacy_widget_shift,
-        ) = _sur_repair_legacy_widget_shift(
-            clear_segment_history,
-            unload_models_between_segments,
-            merge_segments,
-            merged_filename_prefix,
-            enable_checkpoint,
-            auto_resume_checkpoint,
-            clear_checkpoint_on_finish,
-            pre_segment_paths,
-            reference_image_node_id,
-            segment_reference_images,
-            audio_mode,
-        )
-        cleanup_between_segments = _sur_bool(cleanup_between_segments, True)
-        deep_cleanup_between_segments = _sur_bool(deep_cleanup_between_segments, True)
+        load_nid     = str(load_video_node_id or "").strip()
+        combine_nid  = str(combine_video_node_id or "").strip()
+        trimmer_nid  = str(trimmer_node_id or "").strip()
+        bridge_trimmer_nid = str(bridge_trimmer_node_id or "").strip()
+        try:
+            vfi_bridge_frames = max(1, int(vfi_bridge_frames or 1))
+        except Exception:
+            vfi_bridge_frames = 1
+        try:
+            trim_override = max(0, int(trim_multiplier_override or _legacy.get("trim_multiplier_override") or 0))
+        except Exception:
+            trim_override = 0
         prune_cleanup_debug_nodes = _sur_bool(prune_cleanup_debug_nodes, True)
         clear_segment_history = _sur_bool(clear_segment_history, True)
-        unload_models_between_segments = _sur_bool(unload_models_between_segments, False)
         merge_segments = _sur_bool(merge_segments, True)
-        cleanup_selectors = _parse_selectors(cleanup_node_selectors)
+        cleanup_selectors = _parse_selectors(
+            _legacy.get(
+                "cleanup_node_selectors",
+                "DeepRAMCleanNode,SegmentDeepRAMCleanNode,VRAM_Debug,easy showAnything,PreviewImage,SaveImage",
+            )
+        )
         merged_filename_prefix = str(merged_filename_prefix or "sur_merged").strip() or "sur_merged"
         enable_checkpoint = _sur_bool(enable_checkpoint, True)
         auto_resume_checkpoint = _sur_bool(auto_resume_checkpoint, True)
@@ -2408,6 +2274,20 @@ class SegmentUpscaleRunner:
         reference_image_node_id = str(reference_image_node_id or "").strip()
         segment_reference_images = str(segment_reference_images or "").strip()
         audio_mode = str(audio_mode or "keep_original")
+        segment_io_mode = str(segment_io_mode or _legacy.get("segment_io_mode") or "frame_window")
+        if segment_io_mode not in ("frame_window", "physical_slices"):
+            segment_io_mode = "frame_window"
+        physical_mode = segment_io_mode == "physical_slices"
+        physical_slice_subdir = _sur_clean_rel_dir(
+            physical_slice_subdir or _legacy.get("physical_slice_subdir") or "SUR_physical_segments"
+        )
+        try:
+            raw_crf = physical_slice_crf if physical_slice_crf is not None else _legacy.get("physical_slice_crf", 12)
+            physical_slice_crf = max(0, min(30, int(raw_crf)))
+        except Exception:
+            physical_slice_crf = 12
+        reuse_physical_slices = _sur_bool(reuse_physical_slices, True)
+        legacy_widget_shift = False
         uid          = unique_id
 
         def log(msg):
@@ -2416,25 +2296,37 @@ class SegmentUpscaleRunner:
         extra_info = extra_pnginfo if isinstance(extra_pnginfo, dict) else {}
         full_prompt = extra_info.get("sur_full_prompt") or prompt
         client_id   = str(extra_info.get("sur_client_id") or _sur_current_client_id() or "")
-        load_nid = _sur_auto_node_id(full_prompt, load_nid, ("VHS_LoadVideo", "VHS_LoadVideoFFmpeg"), "load_video_node_id", log=log)
+        load_nid = _sur_auto_node_id(
+            full_prompt, load_nid,
+            ("VHS_LoadVideo", "VHS_LoadVideoFFmpeg", "VHS_LoadVideoPath", "VHS_LoadVideoFFmpegPath"),
+            "load_video_node_id", log=log
+        )
         combine_nid = _sur_auto_node_id(full_prompt, combine_nid, "VHS_VideoCombine", "combine_video_node_id", log=log)
         trimmer_nid = _sur_auto_node_id(full_prompt, trimmer_nid, "SegmentFrameTrimmer", "trimmer_node_id", log=log)
+        bridge_trimmer_nid = _sur_auto_node_id(
+            full_prompt,
+            bridge_trimmer_nid,
+            "SegmentVfiBridgeTrimmer",
+            "bridge_trimmer_node_id",
+            log=log,
+        )
         trim_multiplier, trim_note = _infer_trimmer_trim_multiplier(full_prompt, trimmer_nid)
         if trim_override > 0:
             trim_multiplier, trim_note = trim_override, "手动覆盖"
+        bridge_enabled = bool(bridge_trimmer_nid and overlap > 0)
 
         # ── 预览模式 ──────────────────────────────────────────────
         if not execute:
             plan = _build_plan_text(
                 total_frames, segments, start_from,
-                overlap, load_nid, trimmer_nid,
-                trim_multiplier, trim_note
+                overlap, load_nid, trimmer_nid, bridge_trimmer_nid,
+                vfi_bridge_frames,
+                trim_multiplier, trim_note,
+                segment_io_mode=segment_io_mode,
+                physical_slice_subdir=physical_slice_subdir,
             )
             _sur_log(uid, "[预览模式]\n" + plan)
-            threading.Thread(
-                target=lambda: (time.sleep(0.01), _interrupt_current()),
-                daemon=True,
-            ).start()
+            _interrupt_current()
             return {}
 
         # ── 执行前校验 ────────────────────────────────────────────
@@ -2455,6 +2347,8 @@ class SegmentUpscaleRunner:
         nid_checks = [(load_nid, "VHS_LoadVideo"), (combine_nid, "VHS_VideoCombine")]
         if trimmer_nid:
             nid_checks.append((trimmer_nid, "SegmentFrameTrimmer"))
+        if bridge_trimmer_nid:
+            nid_checks.append((bridge_trimmer_nid, "SegmentVfiBridgeTrimmer"))
         for nid, label in nid_checks:
             if nid not in (full_prompt or {}):
                 log(f"✗ 找不到 {label} 节点 ID「{nid}」")
@@ -2500,6 +2394,10 @@ class SegmentUpscaleRunner:
         audio_filename = _sur_find_audio_filename(base_prompt, load_nid)
         base_start_time = _sur_base_video_start_time(base_prompt, load_nid)
         base_skip_frames = _sur_base_video_skip_frames(base_prompt, load_nid)
+        source_video_path = _sur_resolve_media_path(audio_filename) if audio_filename else None
+        base_frame_offset = int(base_skip_frames)
+        if base_start_time > 0 and frame_rate > 0:
+            base_frame_offset += int(round(base_start_time * frame_rate))
         ref_images_list = [
             x.strip()
             for x in segment_reference_images.split(",")
@@ -2508,13 +2406,23 @@ class SegmentUpscaleRunner:
         if ref_images_list:
             ref_images_list = _sur_prepare_reference_images(ref_images_list, unique_id=uid)
 
+        if physical_mode and not source_video_path:
+            log("✗ 物理分片模式需要 VHS_LoadVideo.video 指向可解析的源视频文件")
+            _interrupt_current()
+            return {}
+
         def submit_all():
             try:
                 log(f"{'═'*20} 开始执行 stamp={run_stamp} {'═'*20}")
                 log(f"LoadVideo [{load_nid}]  VideoCombine [{combine_nid}]"
-                    + (f"  Trimmer [{trimmer_nid}]" if trimmer_nid else ""))
-                log(f"总帧数={total_frames}  共{segments}段  重叠帧={overlap}"
+                    + (f"  FinalTrimmer [{trimmer_nid}]" if trimmer_nid else "")
+                    + (f"  BridgeTrimmer [{bridge_trimmer_nid}]" if bridge_trimmer_nid else ""))
+                log(f"总帧数={total_frames}  共{segments}段  模型上下文重叠={overlap}帧"
                     f"  执行第{start_from}~{len(seg_list)}段")
+                if bridge_enabled:
+                    log(f"VFI 前桥接裁剪=开  桥接帧={vfi_bridge_frames}（重叠区不会整段进入 RIFE/VFI）")
+                elif overlap > 0:
+                    log("VFI 前桥接裁剪=关（兼容旧模式：重叠区会完整进入 RIFE/VFI）")
                 if resume_note:
                     log(resume_note)
                 if pre_paths:
@@ -2524,19 +2432,38 @@ class SegmentUpscaleRunner:
                 if audio_mode != "keep_original":
                     log(f"音频模式: {audio_mode}" + (f"  源: {audio_filename}" if audio_filename else ""))
                 if trimmer_nid:
-                    log(f"Trimmer 输出裁剪倍率=x{trim_multiplier}  来源: {trim_note}")
+                    log(f"插帧输出倍率=x{trim_multiplier}  来源: {trim_note}")
                 if legacy_widget_shift:
                     log("检测到旧版工作流 widgets_values 顺序，已按旧参数自动兼容")
                 log("前端执行状态转发=" + ("开" if client_id else "关（未取得 client_id）"))
                 log(
-                    "段间清理="
-                    + ("开" if cleanup_between_segments else "关")
-                    + ("（深度）" if cleanup_between_segments and deep_cleanup_between_segments else "")
-                    + ("  模型卸载=开" if cleanup_between_segments and unload_models_between_segments else "")
-                    + f"  history清理={'开' if clear_segment_history else '关'}"
-                    + f"  图内清理分支裁剪={'开' if prune_cleanup_debug_nodes else '关'}"
+                    f"history清理={'开' if clear_segment_history else '关'}"
+                    + f"  跳过预览/调试旁路={'开' if prune_cleanup_debug_nodes else '关'}"
                     + f"  自动合并={'开' if merge_segments else '关'}"
                 )
+
+                physical_slices: dict[int, dict[str, str]] = {}
+                physical_output_subfolder = ""
+                if physical_mode:
+                    physical_output_subfolder = f"{physical_slice_subdir}/{run_stamp}/results/"
+                    if audio_mode == "keep_original":
+                        log("  ⚠ 物理分片模式建议将 audio_mode 设为 segment_from_loadvideo，避免重叠段音频未同步裁剪。")
+                    try:
+                        physical_slices = _sur_prepare_physical_slices(
+                            source_video_path,
+                            seg_list,
+                            run_stamp,
+                            physical_slice_subdir,
+                            base_frame_offset,
+                            frame_rate,
+                            physical_slice_crf,
+                            reuse_physical_slices,
+                            log=log,
+                        )
+                    except Exception as e:
+                        log(f"✗ 物理分片准备失败: {type(e).__name__}: {e}")
+                        return
+                    log(f"成果目录: output/{physical_output_subfolder.rstrip('/')}")
 
                 segment_output_paths: list[str] = list(pre_paths)
                 _t0 = time.time()
@@ -2544,19 +2471,26 @@ class SegmentUpscaleRunner:
 
                 if not segs_to_run:
                     log("没有需要执行的分段；如果开启合并，将尝试使用 checkpoint/pre_segment_paths 中的视频。")
+                    if len(segment_output_paths) >= len(seg_list):
+                        _all_done = True
 
                 for run_index, (seg_num, load_skip, load_limit, trim) in enumerate(segs_to_run):
-                    if cleanup_between_segments and run_index > 0:
-                        log("  下一段启动前轻清理...")
-                        _clear_comfy_execution_cache(log=log)
-
-                    output_trim = _output_trim_for_overlap(trim, trim_multiplier)
+                    pre_vfi_trim, vfi_overlap, final_trim_input = _bridge_plan(
+                        trim, vfi_bridge_frames, bridge_enabled
+                    )
+                    output_trim = _output_trim_for_overlap(final_trim_input, trim_multiplier)
+                    tail_trim = _output_tail_trim_for_segment(
+                        overlap > 0,
+                        seg_num == len(seg_list),
+                        trim_multiplier,
+                    )
                     saved_start = load_skip + trim
                     saved_end   = load_skip + load_limit - 1
                     saved_n     = load_limit - trim
                     log(f"── 第{seg_num}/{len(seg_list)}段  "
                         f"skip={load_skip}  limit={load_limit}  "
-                        f"trim_in={trim}  trim_out={output_trim}"
+                        f"ctx={trim}  pre_vfi_trim={pre_vfi_trim}  "
+                        f"vfi_bridge={vfi_overlap}  head_trim={output_trim}  tail_trim={tail_trim}"
                         f"  保存[{saved_start}~{saved_end}] ──")
 
                     wf = copy.deepcopy(base_prompt)
@@ -2568,22 +2502,38 @@ class SegmentUpscaleRunner:
                             log("  图内清理/调试节点连接到非调试节点，保留: " + ", ".join(blockers))
 
                     # 1. 修改 VHS_LoadVideo / VHS_LoadVideoFFmpeg
-                    _sur_set_load_video_segment(
-                        wf, load_nid, load_skip, load_limit, frame_rate,
-                        base_start_time=base_start_time,
-                        base_skip_frames=base_skip_frames,
-                        log=log
-                    )
+                    if physical_mode:
+                        slice_info = physical_slices.get(seg_num)
+                        if not slice_info:
+                            log(f"✗ 第{seg_num}段缺少物理分片，已终止")
+                            segment_failed = True
+                            break
+                        _sur_set_load_video_file_segment(
+                            wf, load_nid,
+                            slice_info["abs"], slice_info["rel"],
+                            load_limit,
+                            log=log,
+                        )
+                    else:
+                        _sur_set_load_video_segment(
+                            wf, load_nid, load_skip, load_limit, frame_rate,
+                            base_start_time=base_start_time,
+                            base_skip_frames=base_skip_frames,
+                            log=log
+                        )
 
                     # 2. 修改 SegmentFrameTrimmer（写入 VFI 后的输出裁剪帧数）
+                    if bridge_trimmer_nid and bridge_trimmer_nid in wf:
+                        wf[bridge_trimmer_nid]["inputs"]["trim_frames"] = pre_vfi_trim
                     if trimmer_nid and trimmer_nid in wf:
                         wf[trimmer_nid]["inputs"]["trim_frames"] = output_trim
+                        wf[trimmer_nid]["inputs"]["tail_trim_frames"] = tail_trim
 
                     # 3. 修改 VHS_VideoCombine：唯一文件名前缀，避免覆盖
                     seg_prefix  = f"sur_seg{seg_num:02d}_{run_stamp}_"
                     orig_prefix = wf[combine_nid]["inputs"].get("filename_prefix", "")
                     slash       = max(orig_prefix.rfind("/"), orig_prefix.rfind("\\"))
-                    subfolder   = orig_prefix[:slash + 1] if slash >= 0 else ""
+                    subfolder   = physical_output_subfolder if physical_mode else (orig_prefix[:slash + 1] if slash >= 0 else "")
                     wf[combine_nid]["inputs"]["filename_prefix"] = subfolder + seg_prefix
                     wf[combine_nid]["inputs"]["save_output"]     = True
                     wf[combine_nid]["inputs"]["save_metadata"]   = False
@@ -2631,9 +2581,13 @@ class SegmentUpscaleRunner:
                                     "total_frames_used": total_frames,
                                     "frame_rate_used": frame_rate,
                                     "overlap_frames": overlap,
+                                    "vfi_bridge_frames": vfi_bridge_frames,
                                     "load_video_node_id": load_nid,
                                     "combine_video_node_id": combine_nid,
                                     "trimmer_node_id": trimmer_nid,
+                                    "bridge_trimmer_node_id": bridge_trimmer_nid,
+                                    "segment_io_mode": segment_io_mode,
+                                    "physical_slice_subdir": physical_slice_subdir,
                                     "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
                                 })
                             elapsed = time.time() - _t0
@@ -2649,22 +2603,17 @@ class SegmentUpscaleRunner:
                         log(f"✗ 第{seg_num}段提交失败: {type(e).__name__}: {e}")
                     finally:
                         wf = None
-                        if cleanup_between_segments:
-                            time.sleep(0.5)
-                            _run_post_segment_clean(
-                                log,
-                                deep=deep_cleanup_between_segments,
-                                unload_models=unload_models_between_segments,
-                            )
 
                     if segment_failed:
                         break
 
                 if merge_segments:
-                    if len(segment_output_paths) >= 2:
+                    if not _all_done:
+                        log("自动合并已跳过：任务未全部完成，避免生成不完整合并视频。")
+                    elif len(segment_output_paths) >= 2:
                         orig_prefix = base_prompt[combine_nid]["inputs"].get("filename_prefix", "") if combine_nid in base_prompt else ""
                         slash = max(orig_prefix.rfind("/"), orig_prefix.rfind("\\"))
-                        subfolder = orig_prefix[:slash + 1] if slash >= 0 else ""
+                        subfolder = physical_output_subfolder if physical_mode else (orig_prefix[:slash + 1] if slash >= 0 else "")
                         output_root = folder_paths.get_output_directory()
                         output_dir = os.path.join(output_root, subfolder.rstrip("/\\")) if subfolder else output_root
                         os.makedirs(output_dir, exist_ok=True)
@@ -2823,15 +2772,14 @@ async def sur_upload_video_api(request):
 NODE_CLASS_MAPPINGS = {
     "SegmentUpscaleRunner": SegmentUpscaleRunner,
     "SegmentFrameTrimmer":  SegmentFrameTrimmer,
+    "SegmentVfiBridgeTrimmer": SegmentVfiBridgeTrimmer,
     "SegmentRunLogViewer":  SegmentRunLogViewer,
-    "SegmentDeepRAMCleanNode": SegmentDeepRAMCleanNode,
-    "DeepRAMCleanNode": SegmentDeepRAMCleanNode,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "SegmentUpscaleRunner": "Segment Upscale Runner 🎬",
-    "SegmentFrameTrimmer":  "Segment Frame Trimmer ✂️",
+    "SegmentFrameTrimmer":  "Segment Final Frame Trimmer ✂️",
+    "SegmentVfiBridgeTrimmer": "Segment VFI Bridge Trimmer",
     "SegmentRunLogViewer":  "Segment Run Log Viewer 📋",
-    "SegmentDeepRAMCleanNode": "Segment Deep RAM Cleaner",
-    "DeepRAMCleanNode": "Segment Deep RAM Cleaner",
 }
+

@@ -20,8 +20,8 @@
         "tooltip": "从第几段开始。手动续跑时修改此值。"
       },
       "overlap_frames": {
-        "name": "重叠帧",
-        "tooltip": "从上一段复用的输入上下文帧。后续段会用 SegmentFrameTrimmer 裁掉生成后的重叠输出。"
+        "name": "模型上下文重叠帧",
+        "tooltip": "第2段起向前多读的原始输入帧，给放大、去噪等时序模型当上下文。"
       },
       "execute": {
         "name": "执行",
@@ -36,36 +36,28 @@
         "tooltip": "VHS_VideoCombine 的节点 ID。"
       },
       "trimmer_node_id": {
-        "name": "裁帧节点 ID",
-        "tooltip": "SegmentFrameTrimmer 的节点 ID。overlap_frames 大于 0 时必须填写。"
+        "name": "最终去重裁帧节点 ID",
+        "tooltip": "SegmentFrameTrimmer 的节点 ID。放在 RIFE/VFI 之后、VHS_VideoCombine 之前。"
+      },
+      "bridge_trimmer_node_id": {
+        "name": "VFI 前桥接裁剪节点 ID",
+        "tooltip": "SegmentVfiBridgeTrimmer 的节点 ID。放在放大/去噪之后、RIFE/VFI 之前，用来避免重叠区重复插帧。"
+      },
+      "vfi_bridge_frames": {
+        "name": "VFI 桥接帧",
+        "tooltip": "进入 RIFE/VFI 前保留多少帧上一段尾部。普通插帧建议 1；边界仍抖动可试 2。"
       },
       "trim_multiplier_override": {
-        "name": "裁剪倍率覆盖",
-        "tooltip": "0 = 自动识别 Trimmer 上游的 RIFE/VFI 倍率。自动失败时可手动填 2、4 等。"
-      },
-      "cleanup_between_segments": {
-        "name": "段间清理",
-        "tooltip": "每段完成后清理 ComfyUI 执行缓存、CUDA 缓存和 Python GC。"
-      },
-      "deep_cleanup_between_segments": {
-        "name": "深度清理",
-        "tooltip": "每段完成后调用本插件内置的 SegmentDeepRAMCleanNode 清理内核。"
+        "name": "插帧输出倍率",
+        "tooltip": "0 = 自动识别最终裁帧节点上游的 RIFE/VFI 倍率。自动失败时可手动填 2、4 等。"
       },
       "prune_cleanup_debug_nodes": {
-        "name": "移除调试分支",
-        "tooltip": "从每段子 prompt 中移除清理、调试、预览和临时保存分支。"
-      },
-      "cleanup_node_selectors": {
-        "name": "清理节点选择器",
-        "tooltip": "要从子 prompt 移除的节点 ID 或 class type，逗号分隔。"
+        "name": "跳过预览/调试旁路",
+        "tooltip": "从每段子 prompt 中跳过预览、show、debug、旧清理分支。这不是内存清理。"
       },
       "clear_segment_history": {
         "name": "清理分段历史",
         "tooltip": "记录输出路径后删除该子 prompt 的 history，减少长任务历史记录积压。"
-      },
-      "unload_models_between_segments": {
-        "name": "段间卸载模型",
-        "tooltip": "更激进的清理。可释放更多内存，但下一段需要重新加载模型。"
       },
       "merge_segments": {
         "name": "合并分段",
@@ -102,23 +94,52 @@
       "audio_mode": {
         "name": "音频模式",
         "tooltip": "keep_original = 保持现有音频接线；segment_from_loadvideo = 从源视频按段切音频；disable_audio = 移除音频。"
+      },
+      "segment_io_mode": {
+        "name": "分段输入模式",
+        "tooltip": "frame_window = 默认改 LoadVideo 的跳过帧/最高帧；physical_slices = 先把源视频切成 input 小片段，再逐片执行。"
+      },
+      "physical_slice_subdir": {
+        "name": "物理分片目录",
+        "tooltip": "源片段写入 input/该目录/时间戳/source，成果写入 output/该目录/时间戳/results。"
+      },
+      "physical_slice_crf": {
+        "name": "分片 CRF",
+        "tooltip": "切片中间视频的 H.264 CRF。12 质量很高；0 = 近似无损但文件很大。"
+      },
+      "reuse_physical_slices": {
+        "name": "复用已有分片",
+        "tooltip": "同一时间戳续跑时复用已存在的源分片，避免重复切片。"
       }
     }
   },
   "SegmentFrameTrimmer": {
-    "display_name": "分段裁帧器",
-    "description": "保存前裁掉分段开头的重叠帧。",
+    "display_name": "最终去重裁帧器",
+    "description": "保存前裁掉分段开头的重复桥接帧。由 Runner 自动控制。",
     "inputs": {
       "images": {
         "name": "图像序列"
       },
       "trim_frames": {
-        "name": "裁掉帧数",
-        "tooltip": "从帧序列头部裁掉的帧数，由 SegmentUpscaleRunner 自动写入。"
+        "name": "自动裁掉输出帧数",
+        "tooltip": "由 SegmentUpscaleRunner 自动写入，普通使用不要手动修改。"
       },
-      "clone_output": {
-        "name": "复制输出",
-        "tooltip": "高级选项。复制裁剪结果以脱离原始大张量引用，但会临时增加 RAM。"
+      "tail_trim_frames": {
+        "name": "自动裁掉尾部帧数",
+        "tooltip": "由 SegmentUpscaleRunner 自动写入，用于移除 VFI 在分段尾部补出的重复帧。"
+      }
+    }
+  },
+  "SegmentVfiBridgeTrimmer": {
+    "display_name": "VFI 前桥接裁剪器",
+    "description": "放在放大/去噪之后、RIFE/VFI 之前，只保留少量桥接帧给插帧节点。",
+    "inputs": {
+      "images": {
+        "name": "图像序列"
+      },
+      "trim_frames": {
+        "name": "自动裁掉上下文帧数",
+        "tooltip": "由 SegmentUpscaleRunner 自动写入，普通使用不要手动修改。"
       }
     }
   },
@@ -139,27 +160,5 @@
         "tooltip": "读取后清空该 Runner 日志。runner_node_id 留空时不会清空所有日志。"
       }
     }
-  },
-  "SegmentDeepRAMCleanNode": {
-    "display_name": "分段深度 RAM 清理器",
-    "description": "Segment Upscale Runner 内置的 RAM 深度取证与清理节点。",
-    "inputs": {
-      "wait_ffmpeg_subprocess": {"name": "等待 ffmpeg"},
-      "clear_executor_cache": {"name": "清理执行缓存"},
-      "clear_cell_refs": {"name": "清理闭包引用"},
-      "clear_model_cpu_cache": {"name": "清理模型 CPU 缓存"},
-      "os_trim": {"name": "系统级归还内存"},
-      "forensic_tensor_refs": {"name": "取证 tensor 引用"},
-      "forensic_executor": {"name": "取证执行器"},
-      "forensic_models": {"name": "取证模型"},
-      "forensic_subprocess": {"name": "取证子进程"},
-      "forensic_threads": {"name": "取证线程"},
-      "forensic_gc_garbage": {"name": "取证 GC 垃圾"},
-      "any_input": {"name": "任意输入"}
-    }
-  },
-  "DeepRAMCleanNode": {
-    "display_name": "分段深度 RAM 清理器",
-    "description": "内置分段深度 RAM 清理器的兼容类名。"
   }
 }
