@@ -16,8 +16,63 @@ function chainCallback(object, property, callback) {
     }
 }
 
-function currentLocale() {
-    const language = (navigator.language || "").toLowerCase();
+function parseStoredLocale(value) {
+    if (!value) {
+        return "";
+    }
+    try {
+        return JSON.parse(value);
+    } catch (_) {
+        return String(value).replace(/^"(.*)"$/, "$1");
+    }
+}
+
+function currentLocale(context = {}) {
+    const candidates = [
+        app?.ui?.settings?.getSettingValue?.("AGL.Locale"),
+        localStorage.getItem("AGL.Locale"),
+        parseStoredLocale(localStorage.getItem("Comfy.Settings.AGL.Locale")),
+        app?.ui?.settings?.getSettingValue?.("Comfy.Locale"),
+        parseStoredLocale(localStorage.getItem("Comfy.Settings.Comfy.Locale")),
+        context.node?.title,
+        context.nodeData?.display_name,
+        context.nodeData?.displayName,
+    ].filter(Boolean).map((v) => String(v));
+
+    for (const candidate of candidates) {
+        const value = candidate.toLowerCase();
+        if (value.startsWith("zh") || candidate.includes("流式") || candidate.includes("视频")) {
+            return "zh";
+        }
+        if (value.startsWith("ja") || /[\u3040-\u30ff]/.test(candidate)) {
+            return "ja";
+        }
+    }
+    return "en";
+}
+
+function text(context) {
+    return I18N[currentLocale(context)] ?? I18N.en;
+}
+
+function hasChineseUi(context) {
+    return currentLocale(context) === "zh";
+}
+
+function shouldUseJapaneseUi(context) {
+    return currentLocale(context) === "ja";
+}
+
+function shouldUseEnglishUi(context) {
+    return currentLocale(context) === "en";
+}
+
+function legacyLocaleFromBrowserOnly() {
+    return "";
+}
+
+function unusedBrowserLocaleExample() {
+    const language = legacyLocaleFromBrowserOnly();
     if (language.startsWith("zh")) {
         return "zh";
     }
@@ -102,10 +157,6 @@ const I18N = {
     },
 };
 
-function text() {
-    return I18N[currentLocale()] ?? I18N.en;
-}
-
 async function uploadVideo(file) {
     const body = new FormData();
     const safeFile = new File([file], file.name, {
@@ -127,22 +178,8 @@ function setWidgetValue(widget, value) {
     widget.callback?.(value);
 }
 
-function moveWidgetAfter(node, widget, afterName) {
-    if (!node.widgets || !widget) {
-        return;
-    }
-    const from = node.widgets.indexOf(widget);
-    const after = node.widgets.findIndex((w) => w.name === afterName);
-    if (from < 0 || after < 0 || from === after + 1) {
-        return;
-    }
-    node.widgets.splice(from, 1);
-    const newAfter = node.widgets.findIndex((w) => w.name === afterName);
-    node.widgets.splice(newAfter + 1, 0, widget);
-}
-
-function addUploadButton(node) {
-    const labels = text();
+function addUploadButton(node, nodeData) {
+    const labels = text({ node, nodeData });
     const pathWidget = node.widgets?.find((w) => w.name === "video_path");
     if (!pathWidget || node.__surUploadAdded) {
         return;
@@ -177,11 +214,10 @@ function addUploadButton(node) {
         fileInput.click();
     });
     uploadWidget.options.serialize = false;
-    moveWidgetAfter(node, uploadWidget, "video_path");
 }
 
-function localizeWidgetLabels(node) {
-    const labels = text().widgets ?? {};
+function localizeWidgetLabels(node, nodeData) {
+    const labels = text({ node, nodeData }).widgets ?? {};
     for (const widget of node.widgets ?? []) {
         const label = labels[widget.name];
         if (!label) {
@@ -191,18 +227,26 @@ function localizeWidgetLabels(node) {
             widget.label = label;
         } catch (_) {}
         try {
+            Object.defineProperty(widget, "displayName", {
+                configurable: true,
+                get() {
+                    return label;
+                },
+            });
+        } catch (_) {}
+        try {
             widget.options = widget.options ?? {};
             widget.options.label = label;
         } catch (_) {}
     }
 }
 
-function addHelpWidget(node) {
+function addHelpWidget(node, nodeData) {
     if (node.__surHelpAdded || !node.addDOMWidget) {
         return;
     }
     node.__surHelpAdded = true;
-    const labels = text();
+    const labels = text({ node, nodeData });
     const el = document.createElement("div");
     el.style.cssText = [
         "box-sizing:border-box",
@@ -237,7 +281,7 @@ function addHelpWidget(node) {
         setValue() {},
     });
     helpWidget.computeSize = function (width) {
-        return [width, currentLocale() === "zh" ? 96 : 106];
+        return [width, hasChineseUi({ node, nodeData }) ? 96 : 106];
     };
     node.setSize?.([Math.max(node.size?.[0] ?? 0, 360), node.size?.[1] ?? 0]);
 }
