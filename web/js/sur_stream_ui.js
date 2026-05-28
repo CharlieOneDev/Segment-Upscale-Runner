@@ -41,7 +41,7 @@ function currentLocale(context = {}) {
 
     for (const candidate of candidates) {
         const value = candidate.toLowerCase();
-        if (value.startsWith("zh") || candidate.includes("流式") || candidate.includes("视频")) {
+        if (value.startsWith("zh") || /[\u4e00-\u9fff]/.test(candidate)) {
             return "zh";
         }
         if (value.startsWith("ja") || /[\u3040-\u30ff]/.test(candidate)) {
@@ -51,46 +51,18 @@ function currentLocale(context = {}) {
     return "en";
 }
 
-function text(context) {
-    return I18N[currentLocale(context)] ?? I18N.en;
-}
-
-function hasChineseUi(context) {
-    return currentLocale(context) === "zh";
-}
-
-function shouldUseJapaneseUi(context) {
-    return currentLocale(context) === "ja";
-}
-
-function shouldUseEnglishUi(context) {
-    return currentLocale(context) === "en";
-}
-
-function legacyLocaleFromBrowserOnly() {
-    return "";
-}
-
-function unusedBrowserLocaleExample() {
-    const language = legacyLocaleFromBrowserOnly();
-    if (language.startsWith("zh")) {
-        return "zh";
-    }
-    if (language.startsWith("ja")) {
-        return "ja";
-    }
-    return "en";
-}
-
 const I18N = {
     zh: {
         upload: "选择/上传视频",
         uploadFailed: "视频上传失败",
+        selectPlaceholder: "选择已有视频...",
+        refresh: "刷新",
+        noVideos: "没有找到视频文件",
+        previewUnavailable: "预览仅支持 input/output/temp 内的视频；完整路径仍可手动输入。",
         helpTitle: "SUR 流式处理",
         helpLines: [
-            "使用 FlashVSR-v1.1 做放大，按小块直接读写视频，避免把整段变成 ComfyUI 大张量。",
-            "video_path 可填 input 下文件名；点“选择/上传视频”会自动填入。",
-            "output_path 留空会保存到 output/VSRFI；推荐先用 scale=2、插帧=2、chunk=21、桥接帧=1。"
+            "推荐共享 GPU 起步：RIFE，scale=2，插帧=2，chunk=19，桥接=1。",
+            "19/1 会让非首块实际送入 FlashVSR 的帧数保持为 20，接近 VSRFI 参考设置。",
         ],
         widgets: {
             video_path: "视频文件",
@@ -110,11 +82,14 @@ const I18N = {
     ja: {
         upload: "動画を選択/アップロード",
         uploadFailed: "動画のアップロードに失敗しました",
+        selectPlaceholder: "既存の動画を選択...",
+        refresh: "更新",
+        noVideos: "動画ファイルが見つかりません",
+        previewUnavailable: "プレビューは input/output/temp 内の動画のみ対応します。フルパスは手入力できます。",
         helpTitle: "SUR Stream",
         helpLines: [
-            "FlashVSR-v1.1 を使い、小さなチャンク単位で動画を直接読み書きします。",
-            "video_path には input 内のファイル名を指定できます。ボタンで選択すると自動入力されます。",
-            "output_path を空にすると output/VSRFI に保存されます。まずは scale=2、interpolation=2、chunk=21、bridge=1 を推奨します。"
+            "Shared GPU baseline: RIFE, scale=2, interpolation=2, chunk=19, bridge=1.",
+            "19/1 keeps non-first FlashVSR chunks at 20 frames, close to the reference VSRFI setup.",
         ],
         widgets: {
             video_path: "動画ファイル",
@@ -123,7 +98,7 @@ const I18N = {
             scale: "拡大倍率",
             interpolation_factor: "補間倍率",
             vfi_method: "補間方式",
-            frames_per_chunk: "chunk フレーム",
+            frames_per_chunk: "チャンクフレーム",
             bridge_frames: "ブリッジフレーム",
             max_tile_kilopixels: "VSR タイル上限",
             max_gimm_kilopixels: "GIMM 上限",
@@ -134,11 +109,14 @@ const I18N = {
     en: {
         upload: "choose/upload video",
         uploadFailed: "Video upload failed",
+        selectPlaceholder: "choose existing video...",
+        refresh: "refresh",
+        noVideos: "No video files found",
+        previewUnavailable: "Preview works for videos under input/output/temp; full paths can still be typed.",
         helpTitle: "SUR Stream",
         helpLines: [
-            "Uses FlashVSR-v1.1 and streams small chunks directly from video to video instead of building huge ComfyUI tensors.",
-            "video_path can be a filename under input; the upload button fills it automatically.",
-            "Leave output_path blank for output/VSRFI. Good first settings: scale=2, interpolation=2, chunk=21, bridge=1."
+            "Shared-GPU baseline: RIFE, scale=2, interpolation=2, chunk=19, bridge=1.",
+            "19/1 keeps non-first FlashVSR chunks at 20 frames, close to the reference VSRFI setup.",
         ],
         widgets: {
             video_path: "Video File",
@@ -157,17 +135,26 @@ const I18N = {
     },
 };
 
+function text(context) {
+    return I18N[currentLocale(context)] ?? I18N.en;
+}
+
 async function uploadVideo(file) {
     const body = new FormData();
-    const safeFile = new File([file], file.name, {
-        type: file.type,
-        lastModified: file.lastModified,
-    });
-    body.append("image", safeFile);
-    return await api.fetchApi("/upload/image", {
+    body.append("file", file, file.name);
+    return await api.fetchApi("/sur/upload_video", {
         method: "POST",
         body,
     });
+}
+
+async function fetchVideos() {
+    const resp = await api.fetchApi("/sur/list_videos");
+    if (!resp?.ok) {
+        return [];
+    }
+    const data = await resp.json();
+    return Array.isArray(data?.videos) ? data.videos : [];
 }
 
 function setWidgetValue(widget, value) {
@@ -178,42 +165,80 @@ function setWidgetValue(widget, value) {
     widget.callback?.(value);
 }
 
-function addUploadButton(node, nodeData) {
-    const labels = text({ node, nodeData });
-    const pathWidget = node.widgets?.find((w) => w.name === "video_path");
-    if (!pathWidget || node.__surUploadAdded) {
-        return;
+function formatBytes(bytes) {
+    const value = Number(bytes || 0);
+    if (value >= 1024 ** 3) {
+        return `${(value / 1024 ** 3).toFixed(1)}GB`;
     }
-    node.__surUploadAdded = true;
+    if (value >= 1024 ** 2) {
+        return `${(value / 1024 ** 2).toFixed(0)}MB`;
+    }
+    return `${Math.max(1, Math.round(value / 1024))}KB`;
+}
 
-    const fileInput = document.createElement("input");
-    Object.assign(fileInput, {
-        type: "file",
-        accept: "video/webm,video/mp4,video/x-matroska,video/quicktime,image/gif",
-        style: "display: none",
-        onchange: async () => {
-            if (!fileInput.files?.length) {
-                return;
-            }
-            const resp = await uploadVideo(fileInput.files[0]);
-            if (!resp || resp.status !== 200) {
-                alert(`${labels.uploadFailed}: ${resp?.status ?? ""} ${resp?.statusText ?? ""}`);
-                return;
-            }
-            const data = await resp.json();
-            setWidgetValue(pathWidget, data.name);
-            app.canvas.setDirty?.(true, true);
-            app.graph.setDirtyCanvas?.(true, true);
-        },
-    });
-    document.body.append(fileInput);
-    chainCallback(node, "onRemoved", () => fileInput.remove());
+function mediaValue(item) {
+    return item?.relative || item?.name || "";
+}
 
-    const uploadWidget = node.addWidget("button", labels.upload, "video", () => {
-        app.canvas.node_widget = null;
-        fileInput.click();
+function basename(value) {
+    return String(value || "").replace(/\\/g, "/").split("/").filter(Boolean).pop() || "";
+}
+
+function subfolderFromValue(value) {
+    const clean = String(value || "").replace(/\\/g, "/");
+    const parts = clean.split("/").filter(Boolean);
+    parts.pop();
+    return parts.join("/");
+}
+
+function fileURL(path) {
+    return api.fileURL ? api.fileURL(path) : path;
+}
+
+function viewUrlForItem(item) {
+    if (!item) {
+        return "";
+    }
+    const params = new URLSearchParams({
+        filename: item.name || basename(mediaValue(item)),
+        type: item.type || "input",
     });
-    uploadWidget.options.serialize = false;
+    if (item.subfolder) {
+        params.set("subfolder", item.subfolder);
+    }
+    return fileURL(`/view?${params.toString()}`);
+}
+
+function viewUrlForValue(value, videos) {
+    const raw = String(value || "").trim();
+    if (!raw) {
+        return "";
+    }
+    const match = videos.find((item) => {
+        const mv = mediaValue(item);
+        return mv === raw || item.name === raw || item.path === raw;
+    });
+    if (match) {
+        return viewUrlForItem(match);
+    }
+    if (raw.startsWith("/") || /^[A-Za-z]:[\\/]/.test(raw)) {
+        return "";
+    }
+    const params = new URLSearchParams({
+        filename: basename(raw),
+        type: "input",
+    });
+    const subfolder = subfolderFromValue(raw);
+    if (subfolder) {
+        params.set("subfolder", subfolder);
+    }
+    return fileURL(`/view?${params.toString()}`);
+}
+
+function markDirty(node) {
+    node.setDirtyCanvas?.(true, true);
+    app.canvas.setDirty?.(true, true);
+    app.graph.setDirtyCanvas?.(true, true);
 }
 
 function localizeWidgetLabels(node, nodeData) {
@@ -281,9 +306,208 @@ function addHelpWidget(node, nodeData) {
         setValue() {},
     });
     helpWidget.computeSize = function (width) {
-        return [width, hasChineseUi({ node, nodeData }) ? 96 : 106];
+        return [width, 78];
     };
-    node.setSize?.([Math.max(node.size?.[0] ?? 0, 360), node.size?.[1] ?? 0]);
+}
+
+function addVideoPanel(node, nodeData) {
+    if (node.__surVideoPanelAdded || !node.addDOMWidget) {
+        return null;
+    }
+    const pathWidget = node.widgets?.find((w) => w.name === "video_path");
+    if (!pathWidget) {
+        return null;
+    }
+    node.__surVideoPanelAdded = true;
+
+    const labels = text({ node, nodeData });
+    const state = {
+        videos: [],
+        hasPreview: false,
+        refresh: null,
+        updatePreview: null,
+    };
+
+    const root = document.createElement("div");
+    root.style.cssText = [
+        "box-sizing:border-box",
+        "width:100%",
+        "display:flex",
+        "flex-direction:column",
+        "gap:6px",
+        "padding:8px",
+        "border:1px solid rgba(255,255,255,0.12)",
+        "border-radius:8px",
+        "background:rgba(0,0,0,0.18)",
+    ].join(";");
+
+    const row = document.createElement("div");
+    row.style.cssText = "display:grid;grid-template-columns:1fr auto;gap:6px;align-items:center;";
+
+    const select = document.createElement("select");
+    select.style.cssText = [
+        "min-width:0",
+        "height:26px",
+        "border-radius:5px",
+        "border:1px solid rgba(255,255,255,0.18)",
+        "background:#242424",
+        "color:rgba(255,255,255,0.9)",
+        "font:12px sans-serif",
+        "padding:2px 6px",
+    ].join(";");
+
+    const refresh = document.createElement("button");
+    refresh.type = "button";
+    refresh.textContent = labels.refresh;
+    refresh.style.cssText = [
+        "height:26px",
+        "border-radius:5px",
+        "border:1px solid rgba(255,255,255,0.18)",
+        "background:#303030",
+        "color:rgba(255,255,255,0.9)",
+        "font:12px sans-serif",
+        "padding:0 8px",
+        "cursor:pointer",
+    ].join(";");
+
+    row.append(select, refresh);
+    root.appendChild(row);
+
+    const video = document.createElement("video");
+    video.controls = true;
+    video.muted = true;
+    video.preload = "metadata";
+    video.style.cssText = [
+        "display:none",
+        "width:100%",
+        "max-height:180px",
+        "border-radius:6px",
+        "background:#111",
+        "object-fit:contain",
+    ].join(";");
+    root.appendChild(video);
+
+    const hint = document.createElement("div");
+    hint.style.cssText = "font:11px/1.35 sans-serif;color:rgba(255,255,255,0.62);white-space:normal;";
+    root.appendChild(hint);
+
+    function fillSelect() {
+        select.innerHTML = "";
+        const placeholder = document.createElement("option");
+        placeholder.value = "";
+        placeholder.textContent = state.videos.length ? labels.selectPlaceholder : labels.noVideos;
+        select.appendChild(placeholder);
+
+        for (const item of state.videos) {
+            const option = document.createElement("option");
+            option.value = mediaValue(item);
+            option.textContent = `${mediaValue(item)} [${item.type || "input"}, ${formatBytes(item.size)}]`;
+            select.appendChild(option);
+        }
+
+        const current = String(pathWidget.value || "");
+        select.value = [...select.options].some((option) => option.value === current) ? current : "";
+    }
+
+    state.updatePreview = function (value = pathWidget.value) {
+        const raw = String(value || "").trim();
+        const src = viewUrlForValue(raw, state.videos);
+        if (src) {
+            video.src = src;
+            video.style.display = "block";
+            hint.textContent = raw;
+            state.hasPreview = true;
+        } else {
+            video.removeAttribute("src");
+            video.style.display = "none";
+            hint.textContent = raw ? labels.previewUnavailable : "";
+            state.hasPreview = false;
+        }
+        fillSelect();
+        markDirty(node);
+    };
+
+    state.refresh = async function () {
+        try {
+            state.videos = await fetchVideos();
+        } catch (error) {
+            console.warn("[SUR] failed to list videos", error);
+            state.videos = [];
+        }
+        fillSelect();
+        state.updatePreview(pathWidget.value);
+    };
+
+    select.onchange = () => {
+        if (!select.value) {
+            return;
+        }
+        setWidgetValue(pathWidget, select.value);
+        state.updatePreview(select.value);
+    };
+    refresh.onclick = () => state.refresh();
+    chainCallback(pathWidget, "callback", () => state.updatePreview(pathWidget.value));
+
+    const panelWidget = node.addDOMWidget("sur_video_panel", "SUR video", root, {
+        serialize: false,
+        hideOnZoom: false,
+        getValue() {
+            return "";
+        },
+        setValue() {},
+    });
+    panelWidget.computeSize = function (width) {
+        return [width, state.hasPreview ? 235 : 70];
+    };
+
+    setTimeout(() => state.refresh(), 0);
+    node.setSize?.([Math.max(node.size?.[0] ?? 0, 420), node.size?.[1] ?? 0]);
+    return state;
+}
+
+function addUploadButton(node, nodeData, videoPanel) {
+    const labels = text({ node, nodeData });
+    const pathWidget = node.widgets?.find((w) => w.name === "video_path");
+    if (!pathWidget || node.__surUploadAdded) {
+        return;
+    }
+    node.__surUploadAdded = true;
+
+    const fileInput = document.createElement("input");
+    Object.assign(fileInput, {
+        type: "file",
+        accept: "video/webm,video/mp4,video/x-matroska,video/quicktime,video/x-msvideo,image/gif",
+        style: "display: none",
+        onchange: async () => {
+            if (!fileInput.files?.length) {
+                return;
+            }
+            const resp = await uploadVideo(fileInput.files[0]);
+            if (!resp || !resp.ok) {
+                alert(`${labels.uploadFailed}: ${resp?.status ?? ""} ${resp?.statusText ?? ""}`);
+                return;
+            }
+            const data = await resp.json();
+            if (!data?.ok) {
+                alert(`${labels.uploadFailed}: ${data?.error ?? ""}`);
+                return;
+            }
+            const value = data.relative || data.name;
+            setWidgetValue(pathWidget, value);
+            await videoPanel?.refresh?.();
+            videoPanel?.updatePreview?.(value);
+            markDirty(node);
+            fileInput.value = "";
+        },
+    });
+    document.body.append(fileInput);
+    chainCallback(node, "onRemoved", () => fileInput.remove());
+
+    const uploadWidget = node.addWidget("button", labels.upload, "video", () => {
+        app.canvas.node_widget = null;
+        fileInput.click();
+    });
+    uploadWidget.options.serialize = false;
 }
 
 app.registerExtension({
@@ -293,9 +517,10 @@ app.registerExtension({
             return;
         }
         chainCallback(nodeType.prototype, "onNodeCreated", function () {
-            localizeWidgetLabels(this);
-            addHelpWidget(this);
-            addUploadButton(this);
+            localizeWidgetLabels(this, nodeData);
+            addHelpWidget(this, nodeData);
+            const panel = addVideoPanel(this, nodeData);
+            addUploadButton(this, nodeData, panel);
         });
     },
 });

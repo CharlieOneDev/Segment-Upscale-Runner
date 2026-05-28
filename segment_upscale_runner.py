@@ -2816,12 +2816,18 @@ def _sur_vsrfi_stream_path() -> str:
 def _sur_vsrfi_vfi_methods() -> list[str]:
     base = os.path.dirname(_sur_vsrfi_stream_path())
     parent = os.path.dirname(base)
-    methods = ["GIMM-VFI"]
+    methods = []
     for name in ("comfyui-frame-interpolation", "ComfyUI-Frame-Interpolation"):
         if os.path.isdir(os.path.join(parent, name)):
             methods.extend(["RIFE", "FILM"])
             break
+    methods.append("GIMM-VFI")
     return methods
+
+
+def _sur_default_vfi_method() -> str:
+    methods = _sur_vsrfi_vfi_methods()
+    return "RIFE" if "RIFE" in methods else methods[0]
 
 
 def _sur_load_vsrfi_stream_module():
@@ -3216,20 +3222,20 @@ class SegmentVSRFIStreamRunner:
                 "vfi_method": (
                     _sur_vsrfi_vfi_methods(),
                     {
-                        "default": "GIMM-VFI",
+                        "default": _sur_default_vfi_method(),
                         "display_name": "插帧方法",
-                        "tooltip": "插帧模型。RIFE/FILM 需要安装 ComfyUI-Frame-Interpolation；GIMM-VFI 需要对应模型目录。",
+                        "tooltip": "插帧模型。默认优先 RIFE；RIFE/FILM 需要安装 ComfyUI-Frame-Interpolation；GIMM-VFI 需要对应模型目录。",
                     },
                 ),
                 "frames_per_chunk": (
                     "INT",
                     {
-                        "default": 21,
+                        "default": 19,
                         "min": 1,
                         "max": 100000,
                         "step": 1,
                         "display_name": "每块源帧数",
-                        "tooltip": "每次处理的新源帧数量。越小越省 RAM/VRAM，但速度更慢；12GB 显存可先用 21。",
+                        "tooltip": "每个 chunk 的新源帧数。bridge_frames=1 时推荐 19，使 VSRFI 实际看到 20 帧。",
                     },
                 ),
                 "bridge_frames": (
@@ -3308,8 +3314,8 @@ class SegmentVSRFIStreamRunner:
         execute=False,
         scale=2,
         interpolation_factor=2,
-        vfi_method="GIMM-VFI",
-        frames_per_chunk=21,
+        vfi_method=None,
+        frames_per_chunk=19,
         bridge_frames=1,
         max_tile_kilopixels=0,
         max_gimm_kilopixels=0,
@@ -3332,7 +3338,7 @@ class SegmentVSRFIStreamRunner:
         max_gimm_kilopixels = max(0, int(max_gimm_kilopixels or 0))
         skip_first_frames = max(0, int(skip_first_frames or 0))
         frame_load_cap = max(0, int(frame_load_cap or 0))
-        vfi_method = str(vfi_method or "GIMM-VFI")
+        vfi_method = str(vfi_method or _sur_default_vfi_method())
 
         if not video_path:
             log("No input video was provided.")
@@ -3343,6 +3349,19 @@ class SegmentVSRFIStreamRunner:
         log(f"  output_path={output_path or '(auto: output/VSRFI)'}")
         log(f"  scale={scale}  interpolation_factor={interpolation_factor}  vfi_method={vfi_method}")
         log(f"  frames_per_chunk={frames_per_chunk}  bridge_frames={bridge_frames}")
+        effective_vsr_frames = frames_per_chunk + bridge_frames if bridge_frames > 0 else frames_per_chunk
+        if bridge_frames > 0 and effective_vsr_frames != 20:
+            log(
+                "[INFO] Non-first chunks send bridge_frames + frames_per_chunk to FlashVSR "
+                f"({bridge_frames} + {frames_per_chunk} = {effective_vsr_frames} frames). "
+                "For shared-GPU safety, bridge_frames=1 with frames_per_chunk=19 matches the reference 20-frame VSRFI window."
+            )
+        if bridge_frames > 0 and effective_vsr_frames > 21:
+            log(
+                "[WARN] frames_per_chunk + bridge_frames > 21; FlashVSR will pad this to the next 8n+5 window "
+                f"({effective_vsr_frames} source frames -> 29+ model frames). "
+                "For bridge_frames=1, use frames_per_chunk=19 to stay near the reference 20-frame window."
+            )
         log(f"  max_tile_kilopixels={max_tile_kilopixels}  max_gimm_kilopixels={max_gimm_kilopixels}")
         log(f"  skip_first_frames={skip_first_frames}  frame_load_cap={frame_load_cap}")
 
@@ -3401,8 +3420,21 @@ async def sur_checkpoint_clear_api(request):
 
 def _sur_list_media(exts: tuple[str, ...], max_items: int = 500):
     items = []
+    root_types = {}
+    for getter_name, media_type in (
+        ("get_input_directory", "input"),
+        ("get_output_directory", "output"),
+        ("get_temp_directory", "temp"),
+    ):
+        getter = getattr(folder_paths, getter_name, None)
+        if callable(getter):
+            try:
+                root_types[os.path.realpath(str(getter()))] = media_type
+            except Exception:
+                pass
     for root in _sur_media_roots():
         try:
+            root_type = root_types.get(os.path.realpath(root), "input")
             for dirpath, _, files in os.walk(root):
                 for name in files:
                     if not name.lower().endswith(exts):
@@ -3412,8 +3444,13 @@ def _sur_list_media(exts: tuple[str, ...], max_items: int = 500):
                         st = os.stat(path)
                     except Exception:
                         continue
+                    rel = os.path.relpath(path, root).replace("\\", "/")
+                    subfolder = os.path.dirname(rel).replace("\\", "/")
                     items.append({
                         "name": name,
+                        "relative": rel,
+                        "subfolder": "" if subfolder == "." else subfolder,
+                        "type": root_type,
                         "path": path,
                         "root": root,
                         "size": st.st_size,
@@ -3452,7 +3489,14 @@ async def _sur_upload_file(request, allowed_exts: tuple[str, ...], default_ext: 
             if not chunk:
                 break
             f.write(chunk)
-    return web.json_response({"ok": True, "path": dst, "name": os.path.basename(dst)})
+    return web.json_response({
+        "ok": True,
+        "path": dst,
+        "name": os.path.basename(dst),
+        "relative": os.path.basename(dst),
+        "subfolder": "",
+        "type": "input",
+    })
 
 
 @server.PromptServer.instance.routes.get("/sur/list_images")
