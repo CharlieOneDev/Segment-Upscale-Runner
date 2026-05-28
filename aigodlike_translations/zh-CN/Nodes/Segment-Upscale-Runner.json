@@ -1,7 +1,7 @@
 {
   "SegmentUpscaleRunner": {
     "title": "分段加工队列",
-    "description": "把长视频拆成多个队列分段，每段运行任意自定义加工链路，并可选合并成果物。",
+    "description": "通用分段队列节点：按段改写 LoadVideo 的跳过帧和最高帧数，逐段提交任意 ComfyUI 视频工作流，最后可选合并。",
     "inputs": {
       "total_frames": "总帧数",
       "frame_rate": "帧率"
@@ -29,35 +29,55 @@
       "segment_reference_images": "分段参考图",
       "audio_mode": "音频模式",
       "segment_io_mode": "分段输入模式",
-      "physical_slice_subdir": "物理分片目录",
-      "physical_slice_crf": "分片 CRF",
-      "reuse_physical_slices": "复用已有分片"
+      "physical_slice_subdir": "已弃用：物理分片目录",
+      "physical_slice_crf": "已弃用：分片 CRF",
+      "reuse_physical_slices": "已弃用：复用分片"
+    }
+  },
+  "SegmentVSRFIStreamRunner": {
+    "title": "SUR VSRFI 流式处理",
+    "description": "适合长视频放大插帧的流式节点：从磁盘按块读源视频，跨块携带桥接帧，并直接通过 ffmpeg 写出成片。",
+    "inputs": {},
+    "widgets": {
+      "video_path": "视频路径",
+      "output_path": "输出路径",
+      "execute": "执行",
+      "scale": "放大倍率",
+      "interpolation_factor": "插帧倍率",
+      "vfi_method": "插帧方法",
+      "frames_per_chunk": "每块源帧数",
+      "bridge_frames": "桥接帧",
+      "max_tile_kilopixels": "最大瓦片千像素",
+      "max_gimm_kilopixels": "最大 GIMM 千像素",
+      "skip_first_frames": "跳过开头帧",
+      "frame_load_cap": "处理帧数上限"
     }
   },
   "SegmentFrameTrimmer": {
     "title": "最终去重裁帧器",
-    "description": "保存前裁掉分段开头的重复桥接帧。由 Runner 自动控制。",
+    "description": "保存前裁掉重复桥接输出帧，由分段加工队列自动控制。",
     "inputs": {
       "images": "图像序列"
     },
     "widgets": {
-      "trim_frames": "自动裁掉输出帧数",
-      "tail_trim_frames": "自动裁掉尾部帧数"
+      "trim_frames": "自动头部裁帧",
+      "tail_trim_frames": "自动尾部裁帧"
     }
   },
   "SegmentVfiBridgeTrimmer": {
     "title": "VFI 前桥接裁剪器",
-    "description": "放在放大/去噪之后、RIFE/VFI 之前，只保留少量桥接帧给插帧节点。",
+    "description": "放在放大/去噪之后、VFI 之前，只保留插帧需要的桥接帧。",
     "inputs": {
       "images": "图像序列"
     },
     "widgets": {
-      "trim_frames": "自动裁掉上下文帧数"
+      "trim_frames": "自动上下文裁帧"
     }
   },
   "SegmentRunLogViewer": {
     "title": "分段运行日志查看器",
-    "description": "在 ComfyUI 画布内显示 Segment Upscale Runner 日志。",
+    "description": "在 ComfyUI 画布里显示运行日志。",
+    "inputs": {},
     "widgets": {
       "runner_node_id": "Runner 节点 ID",
       "max_lines": "最大行数",
@@ -65,13 +85,15 @@
     }
   },
   "SegmentVideoInfoProbe": {
-    "title": "视频信息轻量探测器",
-    "description": "只读取视频元信息并输出总帧数/帧率，不加载 IMAGE tensor，适合物理分片模式。",
+    "title": "视频信息探测器",
+    "description": "只读取视频元数据，不加载 IMAGE 张量。",
+    "inputs": {
+      "video": "视频"
+    },
     "widgets": {
-      "video": "视频",
-      "force_rate": "强制帧率",
-      "skip_first_frames": "跳过前 X 帧",
-      "frame_load_cap": "处理总帧数"
+      "force_rate": "强制 FPS",
+      "skip_first_frames": "跳过开头帧",
+      "frame_load_cap": "处理帧数上限"
     }
   }
 }

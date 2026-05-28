@@ -9,6 +9,7 @@ ComfyUI 通用视频分段加工队列节点 (Segment Upscale Runner)
 """
 
 import copy, ctypes, gc, hashlib, json, time, os, platform, shutil, subprocess, sys, tempfile, threading, traceback, urllib.request, urllib.error
+import importlib.util
 import server, folder_paths
 from aiohttp import web
 
@@ -2345,37 +2346,6 @@ class SegmentUpscaleRunner:
                         ),
                     },
                 ),
-                "segment_io_mode": (
-                    ["frame_window", "physical_slices"],
-                    {
-                        "default": "frame_window",
-                        "tooltip": (
-                            "frame_window=默认模式，直接改 LoadVideo 的 skip/cap；\n"
-                            "physical_slices=先把源视频切成小 mp4 放入 input，再逐片执行，适合高清放大+插帧。"
-                        ),
-                    },
-                ),
-                "physical_slice_subdir": (
-                    "STRING",
-                    {
-                        "default": "SUR_physical_segments",
-                        "tooltip": "物理分片专用目录名。源片段写入 input/该目录/时间戳/source，成果写入 output/该目录/时间戳/results。",
-                    },
-                ),
-                "physical_slice_crf": (
-                    "INT",
-                    {
-                        "default": 12, "min": 0, "max": 30, "step": 1,
-                        "tooltip": "切片中间视频的 H.264 CRF。12 质量很高；0=近似无损但文件很大。",
-                    },
-                ),
-                "reuse_physical_slices": (
-                    "BOOLEAN",
-                    {
-                        "default": True,
-                        "tooltip": "同一时间戳续跑时复用已存在的源分片，避免重复切片。",
-                    },
-                ),
             },
             "hidden": {
                 "prompt":       "PROMPT",
@@ -2446,10 +2416,9 @@ class SegmentUpscaleRunner:
         reference_image_node_id = str(reference_image_node_id or "").strip()
         segment_reference_images = str(segment_reference_images or "").strip()
         audio_mode = str(audio_mode or "keep_original")
-        segment_io_mode = str(segment_io_mode or _legacy.get("segment_io_mode") or "frame_window")
-        if segment_io_mode not in ("frame_window", "physical_slices"):
-            segment_io_mode = "frame_window"
-        physical_mode = segment_io_mode == "physical_slices"
+        requested_segment_io_mode = str(segment_io_mode or _legacy.get("segment_io_mode") or "frame_window")
+        segment_io_mode = "frame_window"
+        physical_mode = False
         physical_slice_subdir = _sur_clean_rel_dir(
             physical_slice_subdir or _legacy.get("physical_slice_subdir") or "SUR_physical_segments"
         )
@@ -2464,6 +2433,9 @@ class SegmentUpscaleRunner:
 
         def log(msg):
             _sur_log(uid, f"[SUR] {msg}")
+
+        if requested_segment_io_mode != "frame_window":
+            log(f"分段输入模式 {requested_segment_io_mode} 已退役，本次自动改用 frame_window。")
 
         extra_info = extra_pnginfo if isinstance(extra_pnginfo, dict) else {}
         full_prompt = extra_info.get("sur_full_prompt") or prompt
@@ -2835,6 +2807,551 @@ class SegmentUpscaleRunner:
 
 # ── HTTP 接口：前端拉取日志 ───────────────────────────────────────
 
+
+
+def _sur_vsrfi_stream_path() -> str:
+    return os.path.join(os.path.dirname(_SUR_PLUGIN_DIR), "VSRFI-ComfyUI", "vsrfi_stream.py")
+
+
+def _sur_vsrfi_vfi_methods() -> list[str]:
+    base = os.path.dirname(_sur_vsrfi_stream_path())
+    parent = os.path.dirname(base)
+    methods = ["GIMM-VFI"]
+    for name in ("comfyui-frame-interpolation", "ComfyUI-Frame-Interpolation"):
+        if os.path.isdir(os.path.join(parent, name)):
+            methods.extend(["RIFE", "FILM"])
+            break
+    return methods
+
+
+def _sur_load_vsrfi_stream_module():
+    path = _sur_vsrfi_stream_path()
+    if not os.path.isfile(path):
+        raise RuntimeError("VSRFI-ComfyUI was not found next to this plugin. Install neilthefrobot/VSRFI-ComfyUI first.")
+
+    real_path = os.path.realpath(path)
+    for module in list(sys.modules.values()):
+        try:
+            module_file = os.path.realpath(getattr(module, "__file__", ""))
+        except Exception:
+            continue
+        if module_file == real_path and hasattr(module, "VSRFINode"):
+            return module
+
+    module_name = "_sur_external_vsrfi_stream"
+    module = sys.modules.get(module_name)
+    if module is not None and hasattr(module, "VSRFINode"):
+        return module
+
+    spec = importlib.util.spec_from_file_location(module_name, path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Unable to load VSRFI stream module: {path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def _sur_load_vsrfi_stream_class():
+    return _sur_load_vsrfi_stream_module().VSRFINode
+
+
+def _sur_make_bridge_vsrfi_node(vsrfi_module, base_cls, bridge_frames: int):
+    bridge_frames = max(0, int(bridge_frames or 0))
+
+    class _SURBridgeVSRFINode(base_cls):
+        def process_video(
+            self,
+            input_path,
+            output_path,
+            scale,
+            frames_per_chunk,
+            max_tile_kilopixels,
+            max_gimm_kilopixels,
+            interp_factor,
+            device,
+            vfi_method="GIMM-VFI",
+            skip_first_frames=0,
+            frame_load_cap=0,
+        ):
+            if bridge_frames <= 0:
+                return super().process_video(
+                    input_path,
+                    output_path,
+                    scale,
+                    frames_per_chunk,
+                    max_tile_kilopixels,
+                    max_gimm_kilopixels,
+                    interp_factor,
+                    device,
+                    vfi_method,
+                    skip_first_frames,
+                    frame_load_cap,
+                )
+            return _sur_vsrfi_process_video_with_bridge(
+                self,
+                vsrfi_module,
+                input_path,
+                output_path,
+                scale,
+                frames_per_chunk,
+                max_tile_kilopixels,
+                max_gimm_kilopixels,
+                interp_factor,
+                device,
+                vfi_method,
+                skip_first_frames,
+                frame_load_cap,
+                bridge_frames,
+            )
+
+    return _SURBridgeVSRFINode()
+
+
+def _sur_vsrfi_process_video_with_bridge(
+    node,
+    vsrfi_module,
+    input_path,
+    output_path,
+    scale,
+    frames_per_chunk,
+    max_tile_kilopixels,
+    max_gimm_kilopixels,
+    interp_factor,
+    device,
+    vfi_method="GIMM-VFI",
+    skip_first_frames=0,
+    frame_load_cap=0,
+    bridge_frames=1,
+):
+    cv2 = vsrfi_module.cv2
+    np = vsrfi_module.np
+    torch = vsrfi_module.torch
+    Path = vsrfi_module.Path
+    tqdm = vsrfi_module.tqdm
+    subprocess_mod = vsrfi_module.subprocess
+    comfy_mod = getattr(vsrfi_module, "comfy", None)
+    clean_vram = vsrfi_module.clean_vram
+
+    node._vfi_method = vfi_method
+    frames_per_chunk = max(1, int(frames_per_chunk or 1))
+    bridge_frames = max(0, int(bridge_frames or 0))
+    interp_factor = max(1, int(interp_factor or 1))
+
+    cap = cv2.VideoCapture(input_path)
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    w_orig = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    h_orig = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    total_in_file = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+    if skip_first_frames > 0:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, skip_first_frames)
+        print(f"[SUR Stream] Skipping first {skip_first_frames} frames")
+
+    total = max(0, total_in_file - int(skip_first_frames or 0))
+    if frame_load_cap > 0:
+        total = min(total, int(frame_load_cap))
+        print(f"[SUR Stream] Frame load cap: {frame_load_cap} (will process {total} frames)")
+
+    if total == 0:
+        cap.release()
+        raise ValueError(f"No frames to process (video has {total_in_file} frames, skip_first_frames={skip_first_frames}, frame_load_cap={frame_load_cap})")
+
+    audio_start_time = skip_first_frames / fps if fps > 0 else 0
+    print(f"[SUR Stream] Bridge frames enabled: {bridge_frames}; chunk source frames: {frames_per_chunk}")
+    print(f"[DEBUG] Original input: {w_orig}x{h_orig}, processing frames {skip_first_frames}-{skip_first_frames + total - 1} of {total_in_file}")
+
+    has_audio = False
+    probe_cmd = [
+        "ffprobe", "-v", "error", "-select_streams", "a:0", "-show_entries",
+        "stream=codec_type", "-of", "default=noprint_wrappers=1:nokey=1", input_path,
+    ]
+    try:
+        result = subprocess_mod.run(probe_cmd, capture_output=True, text=True, timeout=5)
+        has_audio = result.stdout.strip() == "audio"
+        print("[INFO] Audio track detected in input video" if has_audio else "[INFO] No audio track found in input video")
+    except FileNotFoundError:
+        print("[WARNING] ffprobe not found. Please install ffmpeg and ensure it is on your system PATH.")
+    except Exception as e:
+        print(f"[WARNING] Could not probe audio: {e}")
+
+    if scale > 0:
+        out_w = w_orig * scale
+        out_h = h_orig * scale
+        print(f"[DEBUG] Output: {out_w}x{out_h} (scale={scale})")
+    else:
+        out_w = w_orig
+        out_h = h_orig
+        print(f"[DEBUG] Output: {out_w}x{out_h} (no upscaling, VFI only)")
+
+    video_only_path = output_path if not has_audio else str(Path(output_path).with_suffix(".temp_video.mp4"))
+    ffmpeg_cmd = [
+        "ffmpeg", "-y",
+        "-f", "rawvideo",
+        "-vcodec", "rawvideo",
+        "-pix_fmt", "rgb24",
+        "-s", f"{out_w}x{out_h}",
+        "-r", str(fps * max(1, interp_factor)),
+        "-i", "-",
+        "-c:v", "libx264",
+        "-preset", "medium",
+        "-crf", "20",
+        "-pix_fmt", "yuv420p",
+        video_only_path,
+    ]
+
+    try:
+        process = subprocess_mod.Popen(ffmpeg_cmd, stdin=subprocess_mod.PIPE, stderr=subprocess_mod.DEVNULL)
+    except FileNotFoundError:
+        raise RuntimeError("ffmpeg not found. Please install ffmpeg and ensure it is on your system PATH.")
+
+    pbar = comfy_mod.utils.ProgressBar(total) if comfy_mod is not None else None
+    buffer = []
+    carry = []
+    frames_processed = 0
+    output_frames_written = 0
+    was_cancelled = False
+    tqdm_bar = None
+
+    def _check_interrupt():
+        if comfy_mod is not None:
+            comfy_mod.model_management.throw_exception_if_processing_interrupted()
+
+    def _discard_count(carry_len: int) -> int:
+        if carry_len <= 0:
+            return 0
+        if interp_factor <= 1:
+            return carry_len
+        return (carry_len - 1) * interp_factor + 1
+
+    def _write_chunk(work_buffer, new_count: int):
+        nonlocal carry, frames_processed, output_frames_written
+        carry_len = len(carry)
+        chunk = node._process_chunk(
+            work_buffer,
+            scale,
+            max_tile_kilopixels,
+            max_gimm_kilopixels,
+            interp_factor,
+            device,
+        )
+        discard = min(_discard_count(carry_len), max(0, len(chunk) - 1))
+        if discard:
+            print(f"[SUR Stream] Dropping {discard} bridge output frames; keeping cross-boundary interpolation.")
+            chunk = chunk[discard:]
+
+        for frame in chunk:
+            frame_out = (frame.detach().cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
+            process.stdin.write(frame_out.tobytes())
+            output_frames_written += 1
+
+        frames_processed += new_count
+        if tqdm_bar is not None:
+            tqdm_bar.update(new_count)
+        if pbar is not None:
+            pbar.update_absolute(frames_processed)
+
+        if bridge_frames > 0:
+            carry = [f.copy() for f in work_buffer[-bridge_frames:]]
+        else:
+            carry = []
+        del chunk
+        clean_vram()
+        gc.collect()
+
+    try:
+        with tqdm(total=total, desc="Processing frames") as tqdm_bar:
+            for _ in range(total):
+                _check_interrupt()
+                ret, frame = cap.read()
+                if not ret:
+                    break
+
+                frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                frame = frame.astype(np.float32) / 255.0
+                buffer.append(frame)
+
+                if len(buffer) >= frames_per_chunk:
+                    _check_interrupt()
+                    work_buffer = carry + buffer
+                    new_count = len(buffer)
+                    _write_chunk(work_buffer, new_count)
+                    buffer = []
+                    del work_buffer
+
+            if buffer:
+                _check_interrupt()
+                work_buffer = carry + buffer
+                new_count = len(buffer)
+                _write_chunk(work_buffer, new_count)
+                buffer = []
+                del work_buffer
+
+    except Exception as e:
+        interrupt_type = getattr(getattr(comfy_mod, "model_management", None), "InterruptProcessingException", None) if comfy_mod is not None else None
+        if interrupt_type is not None and isinstance(e, interrupt_type):
+            was_cancelled = True
+            print(f"\n[INFO] Processing cancelled by user. Saving partial video ({frames_processed}/{total} source frames processed)...")
+            if tqdm_bar is not None:
+                tqdm_bar.write(f"Cancelled - saving partial video to: {output_path}")
+        else:
+            raise
+
+    finally:
+        cap.release()
+        if process.stdin:
+            try:
+                process.stdin.close()
+            except Exception:
+                pass
+        if process:
+            try:
+                process.wait(timeout=10)
+            except subprocess_mod.TimeoutExpired:
+                process.kill()
+                process.wait()
+
+        if has_audio and os.path.exists(video_only_path):
+            try:
+                print("[INFO] Adding audio to output video...")
+                mux_cmd = [
+                    "ffmpeg", "-y",
+                    "-i", video_only_path,
+                    "-ss", str(audio_start_time),
+                    "-i", input_path,
+                    "-map", "0:v:0",
+                    "-map", "1:a:0",
+                    "-c:v", "copy",
+                    "-c:a", "aac",
+                    "-shortest",
+                    output_path,
+                ]
+                result = subprocess_mod.run(mux_cmd, capture_output=True, timeout=30)
+                if result.returncode == 0 and os.path.exists(output_path):
+                    print("[INFO] Audio successfully added to output video")
+                    try:
+                        os.remove(video_only_path)
+                    except Exception:
+                        pass
+                else:
+                    print(f"[WARNING] Audio muxing failed, keeping video-only file at: {video_only_path}")
+                    if os.path.exists(video_only_path):
+                        try:
+                            os.rename(video_only_path, output_path)
+                        except Exception:
+                            pass
+            except Exception as e:
+                print(f"[WARNING] Could not add audio: {e}, keeping video-only file")
+                if os.path.exists(video_only_path) and not os.path.exists(output_path):
+                    try:
+                        os.rename(video_only_path, output_path)
+                    except Exception:
+                        pass
+
+        print(f"[SUR Stream] Source frames processed: {frames_processed}; output frames written: {output_frames_written}")
+        if was_cancelled and comfy_mod is not None:
+            print("[INFO] Partial video saved successfully.")
+            raise comfy_mod.model_management.InterruptProcessingException()
+
+class SegmentVSRFIStreamRunner:
+    """Streaming upscale/interpolation runner backed by VSRFI-ComfyUI.
+
+    This mode is for long video upscale + VFI jobs. It avoids the generic
+    ComfyUI IMAGE tensor chain by letting VSRFI read, process, and encode
+    chunks directly from/to disk.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "video_path": (
+                    "STRING",
+                    {
+                        "default": "",
+                        "tooltip": "Input video path, or a filename relative to ComfyUI/input.",
+                    },
+                ),
+                "output_path": (
+                    "STRING",
+                    {
+                        "default": "",
+                        "tooltip": "Output mp4 path. Leave blank to use output/VSRFI/<input>_VSRFI.mp4.",
+                    },
+                ),
+                "execute": (
+                    "BOOLEAN",
+                    {
+                        "default": False,
+                        "tooltip": "False only prints the planned stream job; True starts processing.",
+                    },
+                ),
+                "scale": (
+                    "INT",
+                    {
+                        "default": 2,
+                        "min": 0,
+                        "max": 16,
+                        "step": 1,
+                        "tooltip": "Spatial scale. 0 skips upscaling and only runs interpolation.",
+                    },
+                ),
+                "interpolation_factor": (
+                    "INT",
+                    {
+                        "default": 2,
+                        "min": 0,
+                        "max": 16,
+                        "step": 1,
+                        "tooltip": "FPS multiplier. 2 turns 25fps into 50fps. Values below 2 skip interpolation.",
+                    },
+                ),
+                "vfi_method": (
+                    _sur_vsrfi_vfi_methods(),
+                    {
+                        "default": "GIMM-VFI",
+                        "tooltip": "RIFE/FILM appear only when ComfyUI-Frame-Interpolation is installed.",
+                    },
+                ),
+                "frames_per_chunk": (
+                    "INT",
+                    {
+                        "default": 21,
+                        "min": 1,
+                        "max": 100000,
+                        "step": 1,
+                        "tooltip": "How many new source frames to process per chunk. Lower is safer for RAM/VRAM.",
+                    },
+                ),
+                "bridge_frames": (
+                    "INT",
+                    {
+                        "default": 1,
+                        "min": 0,
+                        "max": 64,
+                        "step": 1,
+                        "tooltip": "Previous-tail source frames carried into the next chunk. 1 preserves VFI boundary interpolation; 4-8 gives FlashVSR more context.",
+                    },
+                ),
+                "max_tile_kilopixels": (
+                    "INT",
+                    {
+                        "default": 0,
+                        "min": 0,
+                        "max": 100000,
+                        "step": 1,
+                        "tooltip": "VSR tile limit. 0 lets VSRFI auto-pick from available VRAM.",
+                    },
+                ),
+                "max_gimm_kilopixels": (
+                    "INT",
+                    {
+                        "default": 0,
+                        "min": 0,
+                        "max": 100000,
+                        "step": 1,
+                        "tooltip": "GIMM-VFI flow limit. 0 lets VSRFI auto-pick.",
+                    },
+                ),
+                "skip_first_frames": (
+                    "INT",
+                    {"default": 0, "min": 0, "max": 999999, "step": 1},
+                ),
+                "frame_load_cap": (
+                    "INT",
+                    {
+                        "default": 0,
+                        "min": 0,
+                        "max": 999999,
+                        "step": 1,
+                        "tooltip": "0 processes the rest of the video.",
+                    },
+                ),
+            },
+            "hidden": {"unique_id": "UNIQUE_ID"},
+        }
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("output_path",)
+    OUTPUT_NODE = True
+    FUNCTION = "run"
+    CATEGORY = "video/Segment Upscale Runner"
+
+    @classmethod
+    def IS_CHANGED(cls, execute=False, **kwargs):
+        return time.time() if _sur_bool(execute, False) else "preview"
+
+    def run(
+        self,
+        video_path="",
+        output_path="",
+        execute=False,
+        scale=2,
+        interpolation_factor=2,
+        vfi_method="GIMM-VFI",
+        frames_per_chunk=21,
+        bridge_frames=1,
+        max_tile_kilopixels=0,
+        max_gimm_kilopixels=0,
+        skip_first_frames=0,
+        frame_load_cap=0,
+        unique_id=None,
+    ):
+        uid = unique_id
+
+        def log(msg):
+            _sur_log(uid, f"[SUR Stream] {msg}")
+
+        video_path = str(video_path or "").strip().strip('"')
+        output_path = str(output_path or "").strip().strip('"')
+        scale = max(0, int(scale or 0))
+        interpolation_factor = max(0, int(interpolation_factor or 0))
+        frames_per_chunk = max(1, int(frames_per_chunk or 1))
+        bridge_frames = max(0, int(bridge_frames or 0))
+        max_tile_kilopixels = max(0, int(max_tile_kilopixels or 0))
+        max_gimm_kilopixels = max(0, int(max_gimm_kilopixels or 0))
+        skip_first_frames = max(0, int(skip_first_frames or 0))
+        frame_load_cap = max(0, int(frame_load_cap or 0))
+        vfi_method = str(vfi_method or "GIMM-VFI")
+
+        if not video_path:
+            log("No input video was provided.")
+            return ("",)
+
+        log("VSRFI stream mode")
+        log(f"  video_path={video_path}")
+        log(f"  output_path={output_path or '(auto: output/VSRFI)'}")
+        log(f"  scale={scale}  interpolation_factor={interpolation_factor}  vfi_method={vfi_method}")
+        log(f"  frames_per_chunk={frames_per_chunk}  bridge_frames={bridge_frames}")
+        log(f"  max_tile_kilopixels={max_tile_kilopixels}  max_gimm_kilopixels={max_gimm_kilopixels}")
+        log(f"  skip_first_frames={skip_first_frames}  frame_load_cap={frame_load_cap}")
+
+        if not _sur_bool(execute, False):
+            log("Preview only. Set execute=True to start the stream job.")
+            return ("",)
+
+        try:
+            vsrfi_module = _sur_load_vsrfi_stream_module()
+            vsrfi_cls = vsrfi_module.VSRFINode
+            vsrfi_node = _sur_make_bridge_vsrfi_node(vsrfi_module, vsrfi_cls, bridge_frames) if bridge_frames > 0 else vsrfi_cls()
+            out = vsrfi_node.process(
+                video_path,
+                output_path,
+                scale,
+                frames_per_chunk,
+                max_tile_kilopixels,
+                max_gimm_kilopixels,
+                interpolation_factor,
+                vfi_method,
+                skip_first_frames,
+                frame_load_cap,
+            )
+            result_path = out[0] if out else ""
+            log(f"Done: {result_path}")
+            return (result_path,)
+        except Exception as e:
+            log(f"Failed: {type(e).__name__}: {e}")
+            raise
 @server.PromptServer.instance.routes.get("/sur/log")
 async def sur_log_api(request):
     uid   = request.query.get("node_id", "")
@@ -2950,6 +3467,7 @@ NODE_CLASS_MAPPINGS = {
     "SegmentVfiBridgeTrimmer": SegmentVfiBridgeTrimmer,
     "SegmentRunLogViewer":  SegmentRunLogViewer,
     "SegmentVideoInfoProbe": SegmentVideoInfoProbe,
+    "SegmentVSRFIStreamRunner": SegmentVSRFIStreamRunner,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -2958,5 +3476,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "SegmentVfiBridgeTrimmer": "Segment VFI Bridge Trimmer",
     "SegmentRunLogViewer":  "Segment Run Log Viewer 📋",
     "SegmentVideoInfoProbe": "Segment Video Info Probe",
+    "SegmentVSRFIStreamRunner": "SUR VSRFI Stream Runner",
 }
 

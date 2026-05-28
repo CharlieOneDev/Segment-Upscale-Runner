@@ -1,35 +1,35 @@
 {
   "SegmentUpscaleRunner": {
     "display_name": "Segment Upscale Runner",
-    "description": "Split a long video into queued segments, run any custom processing chain per segment, and optionally merge the outputs.",
+    "description": "Generic queued segmentation runner for arbitrary ComfyUI video workflows. It mutates LoadVideo skip/cap per segment and can merge segment videos afterward.",
     "inputs": {
       "total_frames": {
         "name": "Total Frames",
-        "tooltip": "Total video frame count. Connect this to the frame_count output of VHS_LoadVideo."
+        "tooltip": "Total source frame count. Connect this to VHS_LoadVideo.frame_count or Video Info Probe.total_frames."
       },
       "frame_rate": {
         "name": "Frame Rate",
-        "tooltip": "Video frame rate. Connect this to the fps output of VHS_LoadVideo."
+        "tooltip": "Source FPS. Connect this to VHS_LoadVideo.fps or Video Info Probe.frame_rate."
       },
       "segment_count": {
         "name": "Segment Count",
-        "tooltip": "How many segments to split the video into."
+        "tooltip": "How many queued segments to split the job into."
       },
       "start_segment": {
         "name": "Start Segment",
-        "tooltip": "Segment number to start from. Use this for manual resume."
+        "tooltip": "Segment number to start from. Useful for manual resume."
       },
       "overlap_frames": {
         "name": "Model Context Overlap",
-        "tooltip": "Input frames read from the previous segment as temporal context for upscale/denoise models."
+        "tooltip": "Previous-tail source frames read into the next segment as temporal context."
       },
       "execute": {
         "name": "Execute",
-        "tooltip": "Off = preview the segment plan only. On = start the queued segment run."
+        "tooltip": "Off = preview the plan only. On = start the queued segment run."
       },
       "load_video_node_id": {
         "name": "Load Video Node ID",
-        "tooltip": "Node ID of VHS_LoadVideo."
+        "tooltip": "Node ID of VHS_LoadVideo or compatible LoadVideo node."
       },
       "combine_video_node_id": {
         "name": "Video Combine Node ID",
@@ -37,23 +37,23 @@
       },
       "trimmer_node_id": {
         "name": "Final Dedup Trimmer ID",
-        "tooltip": "Node ID of SegmentFrameTrimmer. Place it after RIFE/VFI and before VHS_VideoCombine."
+        "tooltip": "Node ID of SegmentFrameTrimmer. Place it after VFI and before VideoCombine."
       },
       "bridge_trimmer_node_id": {
         "name": "Pre-VFI Bridge Trimmer ID",
-        "tooltip": "Node ID of SegmentVfiBridgeTrimmer. Place it after upscale/denoise and before RIFE/VFI to avoid interpolating the full overlap."
+        "tooltip": "Node ID of SegmentVfiBridgeTrimmer. Place it after upscale/denoise and before VFI."
       },
       "vfi_bridge_frames": {
         "name": "VFI Bridge Frames",
-        "tooltip": "How many previous-tail frames to keep before RIFE/VFI. Use 1 for most interpolation workflows; try 2 if boundaries wobble."
+        "tooltip": "Previous-tail frames kept before VFI. 1 is usually enough; 2 may help unstable boundaries."
       },
       "trim_multiplier_override": {
         "name": "Interpolation Output Multiplier",
-        "tooltip": "0 = auto-detect the RIFE/VFI multiplier upstream of the final trimmer. Set 2, 4, etc. if auto detection fails."
+        "tooltip": "0 = auto-detect. Set 2, 4, etc. if the VFI multiplier cannot be detected."
       },
       "prune_cleanup_debug_nodes": {
         "name": "Skip Preview/Debug Branches",
-        "tooltip": "Skip preview, show, debug, and old cleanup branches in each child prompt. This is not memory cleanup."
+        "tooltip": "Skip preview/show/debug/legacy cleanup branches in child prompts. This is not memory cleanup."
       },
       "clear_segment_history": {
         "name": "Clear Segment History",
@@ -61,7 +61,7 @@
       },
       "merge_segments": {
         "name": "Merge Segments",
-        "tooltip": "Use ffmpeg concat to merge all segment videos when the run finishes."
+        "tooltip": "Merge finished segment videos with ffmpeg concat."
       },
       "merged_filename_prefix": {
         "name": "Merged Filename Prefix",
@@ -73,43 +73,97 @@
       },
       "auto_resume_checkpoint": {
         "name": "Auto Resume Checkpoint",
-        "tooltip": "Resume from checkpoint next_seg when a checkpoint exists."
+        "tooltip": "Resume from checkpoint next_seg when available."
       },
       "clear_checkpoint_on_finish": {
         "name": "Clear Checkpoint On Finish",
-        "tooltip": "Delete the checkpoint automatically after all segments finish."
+        "tooltip": "Delete the checkpoint after all segments finish."
       },
       "pre_segment_paths": {
         "name": "Pre-Segment Paths",
-        "tooltip": "Comma-separated paths to already finished segment videos. They will be placed before new outputs when merging."
+        "tooltip": "Comma-separated already-finished segment videos to prepend during merge."
       },
       "reference_image_node_id": {
         "name": "Reference Image Node ID",
-        "tooltip": "Optional. Node ID of a LoadImage-like node to replace per segment."
+        "tooltip": "Optional LoadImage-like node ID to replace per segment."
       },
       "segment_reference_images": {
         "name": "Segment Reference Images",
-        "tooltip": "Optional comma-separated image paths or filenames. If fewer than segments, the last image is reused."
+        "tooltip": "Optional comma-separated reference image files. If fewer than segments, the last one is reused."
       },
       "audio_mode": {
         "name": "Audio Mode",
-        "tooltip": "keep_original = keep current audio wiring; segment_from_loadvideo = cut audio from source video per segment; disable_audio = remove audio."
+        "tooltip": "keep_original, segment_from_loadvideo, or disable_audio."
       },
       "segment_io_mode": {
         "name": "Segment Input Mode",
-        "tooltip": "frame_window = default skip/cap mode; physical_slices = first cut the source into small input videos, then process one file per segment."
+        "tooltip": "Generic mode now uses frame_window only: mutate LoadVideo skip/cap for each child prompt."
       },
       "physical_slice_subdir": {
-        "name": "Physical Slice Folder",
-        "tooltip": "Source slices go to input/folder/timestamp/source, and results go to output/folder/timestamp/results."
+        "name": "Deprecated Slice Folder",
+        "tooltip": "Deprecated compatibility field. Physical slice mode has been retired."
       },
       "physical_slice_crf": {
-        "name": "Slice CRF",
-        "tooltip": "H.264 CRF for intermediate slice videos. 12 is high quality; 0 is near-lossless but very large."
+        "name": "Deprecated Slice CRF",
+        "tooltip": "Deprecated compatibility field. Physical slice mode has been retired."
       },
       "reuse_physical_slices": {
-        "name": "Reuse Slices",
-        "tooltip": "Reuse existing source slices when resuming the same timestamp."
+        "name": "Deprecated Reuse Slices",
+        "tooltip": "Deprecated compatibility field. Physical slice mode has been retired."
+      }
+    }
+  },
+  "SegmentVSRFIStreamRunner": {
+    "display_name": "SUR VSRFI Stream Runner",
+    "description": "Streaming FlashVSR + VFI runner for long videos. Reads source chunks from disk, carries bridge frames across chunks, and writes encoded video directly through ffmpeg.",
+    "inputs": {
+      "video_path": {
+        "name": "Video Path",
+        "tooltip": "Input video path, or a filename relative to ComfyUI/input."
+      },
+      "output_path": {
+        "name": "Output Path",
+        "tooltip": "Output mp4 path. Leave blank to save under output/VSRFI."
+      },
+      "execute": {
+        "name": "Execute",
+        "tooltip": "Off = preview/log settings. On = process the video."
+      },
+      "scale": {
+        "name": "Scale",
+        "tooltip": "Spatial upscale factor. 0 skips upscaling."
+      },
+      "interpolation_factor": {
+        "name": "Interpolation Factor",
+        "tooltip": "FPS multiplier. 2 turns 25fps into 50fps. Values below 2 skip interpolation."
+      },
+      "vfi_method": {
+        "name": "VFI Method",
+        "tooltip": "GIMM-VFI by default. RIFE/FILM require ComfyUI-Frame-Interpolation."
+      },
+      "frames_per_chunk": {
+        "name": "Frames Per Chunk",
+        "tooltip": "New source frames processed per chunk. Lower is safer; higher is faster."
+      },
+      "bridge_frames": {
+        "name": "Bridge Frames",
+        "tooltip": "Previous-tail source frames carried into the next chunk. 1 preserves boundary interpolation; 4-8 gives FlashVSR more context."
+      },
+      "max_tile_kilopixels": {
+        "name": "Max Tile Kilopixels",
+        "tooltip": "VSR tile limit. 0 lets VSRFI auto-pick from available VRAM."
+      },
+      "max_gimm_kilopixels": {
+        "name": "Max GIMM Kilopixels",
+        "tooltip": "GIMM-VFI flow limit. 0 lets VSRFI auto-pick."
+      },
+      "skip_first_frames": {
+        "name": "Skip First Frames",
+        "tooltip": "Start processing after this many source frames."
+      },
+      "frame_load_cap": {
+        "name": "Frame Load Cap",
+        "tooltip": "0 processes the rest of the video."
       }
     }
   },
@@ -121,65 +175,65 @@
         "name": "Images"
       },
       "trim_frames": {
-        "name": "Auto Output Trim Frames",
-        "tooltip": "Written automatically by SegmentUpscaleRunner. Do not edit manually in normal use."
+        "name": "Auto Head Trim Frames",
+        "tooltip": "Written automatically by SegmentUpscaleRunner."
       },
       "tail_trim_frames": {
         "name": "Auto Tail Trim Frames",
-        "tooltip": "Written automatically by SegmentUpscaleRunner to remove duplicate VFI padding at segment tails."
+        "tooltip": "Written automatically by SegmentUpscaleRunner."
       }
     }
   },
   "SegmentVfiBridgeTrimmer": {
     "display_name": "Pre-VFI Bridge Trimmer",
-    "description": "Place after upscale/denoise and before RIFE/VFI. It keeps only the bridge frames needed for interpolation.",
+    "description": "Place after upscale/denoise and before VFI. It keeps only bridge frames needed for interpolation.",
     "inputs": {
       "images": {
         "name": "Images"
       },
       "trim_frames": {
         "name": "Auto Context Trim Frames",
-        "tooltip": "Written automatically by SegmentUpscaleRunner. Do not edit manually in normal use."
+        "tooltip": "Written automatically by SegmentUpscaleRunner."
       }
     }
   },
   "SegmentRunLogViewer": {
     "display_name": "Segment Run Log Viewer",
-    "description": "Show Segment Upscale Runner logs inside the ComfyUI canvas.",
+    "description": "Show runner logs inside the ComfyUI canvas.",
     "inputs": {
       "runner_node_id": {
         "name": "Runner Node ID",
-        "tooltip": "Node ID of SegmentUpscaleRunner. Leave empty to show all in-memory runner logs."
+        "tooltip": "Leave empty to show all in-memory runner logs."
       },
       "max_lines": {
         "name": "Max Lines",
-        "tooltip": "Maximum number of log lines to display."
+        "tooltip": "Maximum log lines to display."
       },
       "clear_after_read": {
         "name": "Clear After Read",
-        "tooltip": "Clear this runner log after reading. Empty runner_node_id will not clear all logs."
+        "tooltip": "Clear this runner log after reading."
       }
     }
   },
   "SegmentVideoInfoProbe": {
     "display_name": "Video Info Probe",
-    "description": "Read only video metadata and output frame count/fps without loading IMAGE tensors. Useful for physical slice mode.",
+    "description": "Read video metadata without loading IMAGE tensors.",
     "inputs": {
       "video": {
         "name": "Video",
-        "tooltip": "Source video filename or path. Input-folder filenames are supported."
+        "tooltip": "Source video filename or path."
       },
       "force_rate": {
         "name": "Force FPS",
-        "tooltip": "Match VHS_LoadVideo.force_rate. Use 0 to keep the source FPS."
+        "tooltip": "0 keeps source FPS."
       },
       "skip_first_frames": {
         "name": "Skip First Frames",
-        "tooltip": "Match VHS_LoadVideo.skip_first_frames."
+        "tooltip": "Match LoadVideo skip_first_frames."
       },
       "frame_load_cap": {
         "name": "Frame Load Cap",
-        "tooltip": "Total frames to process. 0 means process until the end after skip."
+        "tooltip": "0 means until the end after skip."
       }
     }
   }

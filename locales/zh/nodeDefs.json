@@ -1,67 +1,67 @@
 {
   "SegmentUpscaleRunner": {
     "display_name": "分段加工队列",
-    "description": "把长视频拆成多个队列分段，每段运行任意自定义加工链路，并可选合并成果物。",
+    "description": "通用分段队列节点：按段改写 LoadVideo 的跳过帧和最高帧数，逐段提交任意 ComfyUI 视频工作流，最后可选合并。",
     "inputs": {
       "total_frames": {
         "name": "总帧数",
-        "tooltip": "视频总帧数，连接 VHS_LoadVideo 的 frame_count 输出。"
+        "tooltip": "源视频总帧数。连接 VHS_LoadVideo.frame_count 或视频信息探测.total_frames。"
       },
       "frame_rate": {
         "name": "帧率",
-        "tooltip": "视频帧率，连接 VHS_LoadVideo 的 fps 输出。"
+        "tooltip": "源视频 FPS。连接 VHS_LoadVideo.fps 或视频信息探测.frame_rate。"
       },
       "segment_count": {
         "name": "分段数",
-        "tooltip": "将视频分成几段执行。"
+        "tooltip": "把任务拆成多少个顺序执行的分段。"
       },
       "start_segment": {
         "name": "起始段",
-        "tooltip": "从第几段开始。手动续跑时修改此值。"
+        "tooltip": "从第几段开始，手动续跑时使用。"
       },
       "overlap_frames": {
         "name": "模型上下文重叠帧",
-        "tooltip": "第2段起向前多读的原始输入帧，给放大、去噪等时序模型当上下文。"
+        "tooltip": "下一段额外读取上一段尾部的源帧，给时序模型做上下文参考。"
       },
       "execute": {
         "name": "执行",
-        "tooltip": "关闭 = 只预览分段计划；开启 = 正式开始逐段队列。"
+        "tooltip": "关闭 = 只预览分段计划；开启 = 开始分段队列。"
       },
       "load_video_node_id": {
         "name": "载入视频节点 ID",
-        "tooltip": "VHS_LoadVideo 的节点 ID。"
+        "tooltip": "VHS_LoadVideo 或兼容载入视频节点的 ID。"
       },
       "combine_video_node_id": {
         "name": "视频合成节点 ID",
-        "tooltip": "VHS_VideoCombine 的节点 ID。"
+        "tooltip": "VHS_VideoCombine 节点 ID。"
       },
       "trimmer_node_id": {
         "name": "最终去重裁帧节点 ID",
-        "tooltip": "SegmentFrameTrimmer 的节点 ID。放在 RIFE/VFI 之后、VHS_VideoCombine 之前。"
+        "tooltip": "SegmentFrameTrimmer 节点 ID，放在 VFI 后、VideoCombine 前。"
       },
       "bridge_trimmer_node_id": {
         "name": "VFI 前桥接裁剪节点 ID",
-        "tooltip": "SegmentVfiBridgeTrimmer 的节点 ID。放在放大/去噪之后、RIFE/VFI 之前，用来避免重叠区重复插帧。"
+        "tooltip": "SegmentVfiBridgeTrimmer 节点 ID，放在放大/去噪后、VFI 前。"
       },
       "vfi_bridge_frames": {
         "name": "VFI 桥接帧",
-        "tooltip": "进入 RIFE/VFI 前保留多少帧上一段尾部。普通插帧建议 1；边界仍抖动可试 2。"
+        "tooltip": "进入 VFI 前保留的上一段尾帧数。通常 1 足够，边界不稳可试 2。"
       },
       "trim_multiplier_override": {
         "name": "插帧输出倍率",
-        "tooltip": "0 = 自动识别最终裁帧节点上游的 RIFE/VFI 倍率。自动失败时可手动填 2、4 等。"
+        "tooltip": "0 = 自动识别；识别失败时手动填 2、4 等。"
       },
       "prune_cleanup_debug_nodes": {
         "name": "跳过预览/调试旁路",
-        "tooltip": "从每段子 prompt 中跳过预览、show、debug、旧清理分支。这不是内存清理。"
+        "tooltip": "跳过子 prompt 中的预览、show、debug、旧清理旁路。这不是内存清理。"
       },
       "clear_segment_history": {
         "name": "清理分段历史",
-        "tooltip": "记录输出路径后删除该子 prompt 的 history，减少长任务历史记录积压。"
+        "tooltip": "记录输出路径后，删除每段子 prompt 的 ComfyUI history。"
       },
       "merge_segments": {
         "name": "合并分段",
-        "tooltip": "全部完成后使用 ffmpeg concat 合并所有分段视频。"
+        "tooltip": "所有分段完成后使用 ffmpeg concat 合并视频。"
       },
       "merged_filename_prefix": {
         "name": "合并文件名前缀",
@@ -69,117 +69,171 @@
       },
       "enable_checkpoint": {
         "name": "启用 checkpoint",
-        "tooltip": "每段成功后写入 checkpoint。"
+        "tooltip": "每段成功后写入续跑记录。"
       },
       "auto_resume_checkpoint": {
         "name": "自动续跑 checkpoint",
-        "tooltip": "如果存在 checkpoint，自动从 next_seg 继续。"
+        "tooltip": "存在 checkpoint 时自动从 next_seg 续跑。"
       },
       "clear_checkpoint_on_finish": {
         "name": "完成后清除 checkpoint",
-        "tooltip": "所有分段完成后自动删除 checkpoint。"
+        "tooltip": "全部完成后自动删除 checkpoint。"
       },
       "pre_segment_paths": {
         "name": "前置分段路径",
-        "tooltip": "已完成分段视频路径，逗号分隔；合并时排在本次新输出之前。"
+        "tooltip": "逗号分隔的已完成分段视频，合并时排在本次新输出之前。"
       },
       "reference_image_node_id": {
         "name": "参考图节点 ID",
-        "tooltip": "可选。需要按段替换图片时填写 LoadImage 等节点 ID。"
+        "tooltip": "可选：需要按段替换的 LoadImage 类节点 ID。"
       },
       "segment_reference_images": {
         "name": "分段参考图",
-        "tooltip": "可选。每段参考图路径或文件名，逗号分隔；不足时沿用最后一张。"
+        "tooltip": "可选：逗号分隔的参考图路径或文件名；数量不足时复用最后一张。"
       },
       "audio_mode": {
         "name": "音频模式",
-        "tooltip": "keep_original = 保持现有音频接线；segment_from_loadvideo = 从源视频按段切音频；disable_audio = 移除音频。"
+        "tooltip": "keep_original、segment_from_loadvideo 或 disable_audio。"
       },
       "segment_io_mode": {
         "name": "分段输入模式",
-        "tooltip": "frame_window = 默认改 LoadVideo 的跳过帧/最高帧；physical_slices = 先把源视频切成 input 小片段，再逐片执行。"
+        "tooltip": "通用分段现在只保留 frame_window：逐段改写 LoadVideo 的 skip/cap。"
       },
       "physical_slice_subdir": {
-        "name": "物理分片目录",
-        "tooltip": "源片段写入 input/该目录/时间戳/source，成果写入 output/该目录/时间戳/results。"
+        "name": "已弃用：物理分片目录",
+        "tooltip": "兼容旧工作流字段。物理分片模式已退役。"
       },
       "physical_slice_crf": {
-        "name": "分片 CRF",
-        "tooltip": "切片中间视频的 H.264 CRF。12 质量很高；0 = 近似无损但文件很大。"
+        "name": "已弃用：分片 CRF",
+        "tooltip": "兼容旧工作流字段。物理分片模式已退役。"
       },
       "reuse_physical_slices": {
-        "name": "复用已有分片",
-        "tooltip": "同一时间戳续跑时复用已存在的源分片，避免重复切片。"
+        "name": "已弃用：复用分片",
+        "tooltip": "兼容旧工作流字段。物理分片模式已退役。"
+      }
+    }
+  },
+  "SegmentVSRFIStreamRunner": {
+    "display_name": "SUR VSRFI 流式处理",
+    "description": "适合长视频放大插帧的流式节点：从磁盘按块读源视频，跨块携带桥接帧，并直接通过 ffmpeg 写出成片。",
+    "inputs": {
+      "video_path": {
+        "name": "视频路径",
+        "tooltip": "输入视频路径，或相对于 ComfyUI/input 的文件名。"
+      },
+      "output_path": {
+        "name": "输出路径",
+        "tooltip": "输出 mp4 路径。留空则保存到 output/VSRFI。"
+      },
+      "execute": {
+        "name": "执行",
+        "tooltip": "关闭 = 只记录设置；开启 = 开始处理视频。"
+      },
+      "scale": {
+        "name": "放大倍率",
+        "tooltip": "空间放大倍率。0 表示跳过放大。"
+      },
+      "interpolation_factor": {
+        "name": "插帧倍率",
+        "tooltip": "FPS 倍率。25fps 配 2 会输出 50fps；小于 2 表示跳过插帧。"
+      },
+      "vfi_method": {
+        "name": "插帧方法",
+        "tooltip": "默认 GIMM-VFI。RIFE/FILM 需要安装 ComfyUI-Frame-Interpolation。"
+      },
+      "frames_per_chunk": {
+        "name": "每块源帧数",
+        "tooltip": "每个 chunk 新处理的源帧数。越小越省内存，越大通常越快。"
+      },
+      "bridge_frames": {
+        "name": "桥接帧",
+        "tooltip": "带入下一块的上一块尾部源帧。1 可保留边界插帧；4-8 可给 FlashVSR 更多上下文。"
+      },
+      "max_tile_kilopixels": {
+        "name": "最大瓦片千像素",
+        "tooltip": "VSR 瓦片限制。0 让 VSRFI 根据显存自动选择。"
+      },
+      "max_gimm_kilopixels": {
+        "name": "最大 GIMM 千像素",
+        "tooltip": "GIMM-VFI 光流限制。0 自动选择。"
+      },
+      "skip_first_frames": {
+        "name": "跳过开头帧",
+        "tooltip": "从源视频跳过这么多帧后开始处理。"
+      },
+      "frame_load_cap": {
+        "name": "处理帧数上限",
+        "tooltip": "0 表示处理到视频结尾。"
       }
     }
   },
   "SegmentFrameTrimmer": {
     "display_name": "最终去重裁帧器",
-    "description": "保存前裁掉分段开头的重复桥接帧。由 Runner 自动控制。",
+    "description": "保存前裁掉重复桥接输出帧，由分段加工队列自动控制。",
     "inputs": {
       "images": {
         "name": "图像序列"
       },
       "trim_frames": {
-        "name": "自动裁掉输出帧数",
-        "tooltip": "由 SegmentUpscaleRunner 自动写入，普通使用不要手动修改。"
+        "name": "自动头部裁帧",
+        "tooltip": "由分段加工队列自动写入。"
       },
       "tail_trim_frames": {
-        "name": "自动裁掉尾部帧数",
-        "tooltip": "由 SegmentUpscaleRunner 自动写入，用于移除 VFI 在分段尾部补出的重复帧。"
+        "name": "自动尾部裁帧",
+        "tooltip": "由分段加工队列自动写入。"
       }
     }
   },
   "SegmentVfiBridgeTrimmer": {
     "display_name": "VFI 前桥接裁剪器",
-    "description": "放在放大/去噪之后、RIFE/VFI 之前，只保留少量桥接帧给插帧节点。",
+    "description": "放在放大/去噪之后、VFI 之前，只保留插帧需要的桥接帧。",
     "inputs": {
       "images": {
         "name": "图像序列"
       },
       "trim_frames": {
-        "name": "自动裁掉上下文帧数",
-        "tooltip": "由 SegmentUpscaleRunner 自动写入，普通使用不要手动修改。"
+        "name": "自动上下文裁帧",
+        "tooltip": "由分段加工队列自动写入。"
       }
     }
   },
   "SegmentRunLogViewer": {
     "display_name": "分段运行日志查看器",
-    "description": "在 ComfyUI 画布内显示 Segment Upscale Runner 日志。",
+    "description": "在 ComfyUI 画布里显示运行日志。",
     "inputs": {
       "runner_node_id": {
         "name": "Runner 节点 ID",
-        "tooltip": "SegmentUpscaleRunner 的节点 ID。留空时显示当前内存中所有 Runner 日志。"
+        "tooltip": "留空显示内存中所有 runner 日志。"
       },
       "max_lines": {
         "name": "最大行数",
-        "tooltip": "最多显示多少行日志。"
+        "tooltip": "最多显示的日志行数。"
       },
       "clear_after_read": {
         "name": "读取后清空",
-        "tooltip": "读取后清空该 Runner 日志。runner_node_id 留空时不会清空所有日志。"
+        "tooltip": "读取后清空当前 runner 日志。"
       }
     }
   },
   "SegmentVideoInfoProbe": {
-    "display_name": "视频信息轻量探测器",
-    "description": "只读取视频元信息并输出总帧数/帧率，不加载 IMAGE tensor，适合物理分片模式。",
+    "display_name": "视频信息探测器",
+    "description": "只读取视频元数据，不加载 IMAGE 张量。",
     "inputs": {
       "video": {
         "name": "视频",
-        "tooltip": "源视频文件名或路径。可填写 ComfyUI/input 下的视频文件名。"
+        "tooltip": "源视频文件名或路径。"
       },
       "force_rate": {
-        "name": "强制帧率",
-        "tooltip": "与 VHS_LoadVideo.force_rate 保持一致。0 表示使用源视频帧率。"
+        "name": "强制 FPS",
+        "tooltip": "0 表示使用源视频 FPS。"
       },
       "skip_first_frames": {
-        "name": "跳过前 X 帧",
-        "tooltip": "与 VHS_LoadVideo.skip_first_frames 保持一致。"
+        "name": "跳过开头帧",
+        "tooltip": "与 LoadVideo 的 skip_first_frames 保持一致。"
       },
       "frame_load_cap": {
-        "name": "处理总帧数",
-        "tooltip": "要处理的总帧数。0 表示从 skip 后一直处理到视频末尾。"
+        "name": "处理帧数上限",
+        "tooltip": "0 表示跳过后处理到结尾。"
       }
     }
   }

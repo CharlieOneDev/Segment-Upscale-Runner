@@ -1,185 +1,239 @@
 {
   "SegmentUpscaleRunner": {
     "display_name": "セグメント処理キュー",
-    "description": "長い動画を複数のセグメントに分け、各セグメントを任意の処理ワークフローで順番に実行し、必要に応じて出力を結合します。",
+    "description": "汎用の分割キューです。LoadVideo の skip/cap を区間ごとに書き換え、任意の ComfyUI 動画ワークフローを順番に実行し、必要なら結合します。",
     "inputs": {
       "total_frames": {
         "name": "総フレーム数",
-        "tooltip": "動画の総フレーム数です。VHS_LoadVideo の frame_count 出力に接続してください。"
+        "tooltip": "入力動画の総フレーム数。VHS_LoadVideo.frame_count または Video Info Probe.total_frames に接続します。"
       },
       "frame_rate": {
         "name": "フレームレート",
-        "tooltip": "動画のフレームレートです。VHS_LoadVideo の fps 出力に接続してください。"
+        "tooltip": "入力動画の FPS。VHS_LoadVideo.fps または Video Info Probe.frame_rate に接続します。"
       },
       "segment_count": {
         "name": "分割数",
-        "tooltip": "動画をいくつのセグメントに分けるかを指定します。"
+        "tooltip": "ジョブをいくつの連続セグメントに分けるか。"
       },
       "start_segment": {
         "name": "開始セグメント",
-        "tooltip": "何番目のセグメントから開始するかを指定します。手動再開時に使います。"
+        "tooltip": "何番目のセグメントから開始するか。手動再開に使います。"
       },
       "overlap_frames": {
-        "name": "モデル用コンテキスト重複",
-        "tooltip": "アップスケールやノイズ除去などの時間方向モデル用に、前セグメント末尾から追加で読み込む入力フレーム数です。"
+        "name": "モデル文脈オーバーラップ",
+        "tooltip": "次セグメントに前セグメント末尾の入力フレームを追加し、時系列モデルの文脈にします。"
       },
       "execute": {
         "name": "実行",
-        "tooltip": "オフ = 分割計画のみプレビュー。オン = セグメントキューを実行します。"
+        "tooltip": "オフ = 計画プレビューのみ。オン = 分割キューを開始。"
       },
       "load_video_node_id": {
         "name": "動画読み込みノード ID",
-        "tooltip": "VHS_LoadVideo のノード ID。"
+        "tooltip": "VHS_LoadVideo または互換ノードの ID。"
       },
       "combine_video_node_id": {
         "name": "動画結合ノード ID",
         "tooltip": "VHS_VideoCombine のノード ID。"
       },
       "trimmer_node_id": {
-        "name": "最終重複削除トリマー ID",
-        "tooltip": "SegmentFrameTrimmer のノード ID。RIFE/VFI の後、VHS_VideoCombine の前に置きます。"
+        "name": "最終重複トリマー ID",
+        "tooltip": "SegmentFrameTrimmer の ID。VFI の後、VideoCombine の前に置きます。"
       },
       "bridge_trimmer_node_id": {
         "name": "VFI 前ブリッジトリマー ID",
-        "tooltip": "SegmentVfiBridgeTrimmer のノード ID。アップスケール/ノイズ除去の後、RIFE/VFI の前に置き、重複区間全体の再補間を避けます。"
+        "tooltip": "SegmentVfiBridgeTrimmer の ID。アップスケール/ノイズ除去の後、VFI の前に置きます。"
       },
       "vfi_bridge_frames": {
         "name": "VFI ブリッジフレーム",
-        "tooltip": "RIFE/VFI に入れる前セグメント末尾フレーム数です。通常は 1、境界が揺れる場合は 2 を試してください。"
+        "tooltip": "VFI の前に残す前セグメント末尾フレーム数。通常は 1、境界が不安定なら 2 を試します。"
       },
       "trim_multiplier_override": {
         "name": "補間出力倍率",
-        "tooltip": "0 = 最終トリマー上流の RIFE/VFI 倍率を自動検出。失敗する場合は 2、4 などを手動指定します。"
+        "tooltip": "0 = 自動検出。失敗する場合は 2、4 などを指定します。"
       },
       "prune_cleanup_debug_nodes": {
-        "name": "プレビュー/デバッグ分岐をスキップ",
-        "tooltip": "各子 prompt から preview、show、debug、旧クリーンアップ分岐をスキップします。メモリ解放機能ではありません。"
+        "name": "プレビュー/デバッグ枝をスキップ",
+        "tooltip": "子 prompt の preview/show/debug/旧 cleanup 枝をスキップします。メモリ解放機能ではありません。"
       },
       "clear_segment_history": {
         "name": "セグメント履歴を削除",
-        "tooltip": "出力パスを記録した後、完了した子 prompt の history を削除します。"
+        "tooltip": "出力パスを記録した後、各子 prompt の history を削除します。"
       },
       "merge_segments": {
         "name": "セグメントを結合",
-        "tooltip": "完了後に ffmpeg concat で全セグメント動画を結合します。"
+        "tooltip": "完了後 ffmpeg concat で分割動画を結合します。"
       },
       "merged_filename_prefix": {
-        "name": "結合ファイル名プレフィックス",
-        "tooltip": "結合動画のファイル名プレフィックス。"
+        "name": "結合ファイル接頭辞",
+        "tooltip": "結合動画のファイル名接頭辞。"
       },
       "enable_checkpoint": {
         "name": "checkpoint を有効化",
-        "tooltip": "各セグメント成功後に checkpoint を書き込みます。"
+        "tooltip": "各セグメント成功後に再開情報を書き込みます。"
       },
       "auto_resume_checkpoint": {
         "name": "checkpoint 自動再開",
-        "tooltip": "checkpoint がある場合、next_seg から自動再開します。"
+        "tooltip": "checkpoint があれば next_seg から再開します。"
       },
       "clear_checkpoint_on_finish": {
-        "name": "完了後 checkpoint を削除",
-        "tooltip": "すべてのセグメント完了後に checkpoint を自動削除します。"
+        "name": "完了後 checkpoint 削除",
+        "tooltip": "全完了後に checkpoint を削除します。"
       },
       "pre_segment_paths": {
         "name": "前置セグメントパス",
-        "tooltip": "既に完了しているセグメント動画パスをカンマ区切りで指定します。"
+        "tooltip": "結合時に先頭へ追加する完了済み動画パス。カンマ区切り。"
       },
       "reference_image_node_id": {
         "name": "参照画像ノード ID",
-        "tooltip": "任意。セグメントごとに LoadImage などの画像ノードを差し替える場合に指定します。"
+        "tooltip": "任意。セグメントごとに差し替える LoadImage 系ノード ID。"
       },
       "segment_reference_images": {
         "name": "セグメント参照画像",
-        "tooltip": "任意。セグメントごとの参照画像パスまたはファイル名をカンマ区切りで指定します。"
+        "tooltip": "任意。参照画像のパス/ファイル名をカンマ区切りで指定します。足りない場合は最後を再利用します。"
       },
       "audio_mode": {
         "name": "音声モード",
-        "tooltip": "keep_original = 現在の音声接続を維持；segment_from_loadvideo = 元動画からセグメントごとに音声を切り出す；disable_audio = 音声を削除。"
+        "tooltip": "keep_original、segment_from_loadvideo、disable_audio。"
       },
       "segment_io_mode": {
-        "name": "セグメント入力モード",
-        "tooltip": "frame_window = 通常の skip/cap モード；physical_slices = 元動画を input 内の小さな動画に切り出してから、1 セグメントずつ処理します。"
+        "name": "分割入力モード",
+        "tooltip": "汎用分割は frame_window のみです。各子 prompt で LoadVideo の skip/cap を書き換えます。"
       },
       "physical_slice_subdir": {
-        "name": "物理分割フォルダー",
-        "tooltip": "元スライスは input/フォルダー/タイムスタンプ/source、結果は output/フォルダー/タイムスタンプ/results に保存されます。"
+        "name": "非推奨: 物理分割フォルダ",
+        "tooltip": "旧ワークフロー互換用。物理分割モードは廃止されました。"
       },
       "physical_slice_crf": {
-        "name": "スライス CRF",
-        "tooltip": "中間スライス動画の H.264 CRF。12 は高品質、0 はほぼロスレスですがファイルが大きくなります。"
+        "name": "非推奨: 分割 CRF",
+        "tooltip": "旧ワークフロー互換用。物理分割モードは廃止されました。"
       },
       "reuse_physical_slices": {
-        "name": "既存スライスを再利用",
-        "tooltip": "同じタイムスタンプで再開する場合、既存の元スライスを再利用します。"
+        "name": "非推奨: 分割再利用",
+        "tooltip": "旧ワークフロー互換用。物理分割モードは廃止されました。"
+      }
+    }
+  },
+  "SegmentVSRFIStreamRunner": {
+    "display_name": "SUR VSRFI ストリーム処理",
+    "description": "長尺動画のアップスケール + 補間向けストリームノード。ディスクから chunk 単位で読み、ブリッジフレームを持ち越し、ffmpeg へ直接書き出します。",
+    "inputs": {
+      "video_path": {
+        "name": "動画パス",
+        "tooltip": "入力動画パス、または ComfyUI/input からの相対ファイル名。"
+      },
+      "output_path": {
+        "name": "出力パス",
+        "tooltip": "出力 mp4 パス。空なら output/VSRFI に保存します。"
+      },
+      "execute": {
+        "name": "実行",
+        "tooltip": "オフ = 設定の記録のみ。オン = 処理開始。"
+      },
+      "scale": {
+        "name": "拡大倍率",
+        "tooltip": "空間拡大倍率。0 はアップスケールをスキップ。"
+      },
+      "interpolation_factor": {
+        "name": "補間倍率",
+        "tooltip": "FPS 倍率。25fps で 2 なら 50fps。2 未満は補間なし。"
+      },
+      "vfi_method": {
+        "name": "補間方式",
+        "tooltip": "既定は GIMM-VFI。RIFE/FILM には ComfyUI-Frame-Interpolation が必要です。"
+      },
+      "frames_per_chunk": {
+        "name": "chunk ごとの新規フレーム数",
+        "tooltip": "各 chunk で新しく処理する入力フレーム数。小さいほど安全、大きいほど速くなりやすいです。"
+      },
+      "bridge_frames": {
+        "name": "ブリッジフレーム",
+        "tooltip": "次 chunk に持ち越す前 chunk 末尾の入力フレーム。1 で境界補間を保持、4-8 で FlashVSR の文脈を増やします。"
+      },
+      "max_tile_kilopixels": {
+        "name": "最大タイル千画素",
+        "tooltip": "VSR タイル上限。0 は VRAM に応じて自動選択。"
+      },
+      "max_gimm_kilopixels": {
+        "name": "最大 GIMM 千画素",
+        "tooltip": "GIMM-VFI のフロー推定上限。0 は自動。"
+      },
+      "skip_first_frames": {
+        "name": "先頭スキップフレーム",
+        "tooltip": "この数だけ入力フレームを飛ばして開始します。"
+      },
+      "frame_load_cap": {
+        "name": "処理フレーム上限",
+        "tooltip": "0 は動画末尾まで処理します。"
       }
     }
   },
   "SegmentFrameTrimmer": {
-    "display_name": "最終重複削除フレームトリマー",
-    "description": "保存前に重複ブリッジフレームを削除します。SegmentUpscaleRunner が自動制御します。",
+    "display_name": "最終重複フレームトリマー",
+    "description": "保存前に重複ブリッジ出力を削除します。",
     "inputs": {
       "images": {
-        "name": "画像シーケンス"
+        "name": "画像列"
       },
       "trim_frames": {
-        "name": "自動出力削除フレーム数",
-        "tooltip": "SegmentUpscaleRunner が自動設定します。通常は手動変更しないでください。"
+        "name": "自動先頭トリム",
+        "tooltip": "セグメント処理キューが自動設定します。"
       },
       "tail_trim_frames": {
-        "name": "自動末尾削除フレーム数",
-        "tooltip": "セグメント末尾で VFI が補った重複フレームを削除するため、SegmentUpscaleRunner が自動設定します。"
+        "name": "自動末尾トリム",
+        "tooltip": "セグメント処理キューが自動設定します。"
       }
     }
   },
   "SegmentVfiBridgeTrimmer": {
     "display_name": "VFI 前ブリッジトリマー",
-    "description": "アップスケール/ノイズ除去の後、RIFE/VFI の前に置き、補間に必要なブリッジフレームだけを残します。",
+    "description": "アップスケール/ノイズ除去の後、VFI の前に置き、補間に必要なブリッジだけを残します。",
     "inputs": {
       "images": {
-        "name": "画像シーケンス"
+        "name": "画像列"
       },
       "trim_frames": {
-        "name": "自動コンテキスト削除フレーム数",
-        "tooltip": "SegmentUpscaleRunner が自動設定します。通常は手動変更しないでください。"
+        "name": "自動文脈トリム",
+        "tooltip": "セグメント処理キューが自動設定します。"
       }
     }
   },
   "SegmentRunLogViewer": {
     "display_name": "セグメント実行ログビューア",
-    "description": "ComfyUI キャンバス内で Segment Upscale Runner のログを表示します。",
+    "description": "ComfyUI キャンバス内に実行ログを表示します。",
     "inputs": {
       "runner_node_id": {
         "name": "Runner ノード ID",
-        "tooltip": "SegmentUpscaleRunner のノード ID。空欄の場合はメモリ内の全 Runner ログを表示します。"
+        "tooltip": "空ならメモリ内の全 runner ログを表示します。"
       },
       "max_lines": {
         "name": "最大行数",
-        "tooltip": "表示するログ行数の上限。"
+        "tooltip": "表示する最大ログ行数。"
       },
       "clear_after_read": {
-        "name": "読み取り後にクリア",
-        "tooltip": "読み取り後にこの Runner のログを削除します。runner_node_id が空欄の場合、全ログ削除は行いません。"
+        "name": "読取後クリア",
+        "tooltip": "読み取り後、この runner ログを削除します。"
       }
     }
   },
   "SegmentVideoInfoProbe": {
     "display_name": "動画情報プローブ",
-    "description": "IMAGE tensor を読み込まず、動画メタデータだけから総フレーム数と FPS を出力します。物理分割モード向けです。",
+    "description": "IMAGE tensor をロードせず、動画メタデータのみを読みます。",
     "inputs": {
       "video": {
         "name": "動画",
-        "tooltip": "元動画のファイル名またはパス。ComfyUI/input 内のファイル名も使えます。"
+        "tooltip": "入力動画ファイル名またはパス。"
       },
       "force_rate": {
         "name": "強制 FPS",
-        "tooltip": "VHS_LoadVideo.force_rate と同じ値にします。0 は元動画の FPS を使います。"
+        "tooltip": "0 は元動画の FPS を使います。"
       },
       "skip_first_frames": {
         "name": "先頭スキップフレーム",
-        "tooltip": "VHS_LoadVideo.skip_first_frames と同じ値にします。"
+        "tooltip": "LoadVideo の skip_first_frames に合わせます。"
       },
       "frame_load_cap": {
-        "name": "処理フレーム数",
-        "tooltip": "処理する総フレーム数。0 は skip 後から動画末尾まで処理します。"
+        "name": "処理フレーム上限",
+        "tooltip": "0 は skip 後から末尾まで。"
       }
     }
   }
