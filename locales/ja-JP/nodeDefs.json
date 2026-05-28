@@ -139,7 +139,7 @@
       },
       "vfi_method": {
         "name": "補間方式",
-        "tooltip": "既定は GIMM-VFI。RIFE/FILM には ComfyUI-Frame-Interpolation が必要です。"
+        "tooltip": "利用可能なら RIFE を既定にします。RIFE/FILM には ComfyUI-Frame-Interpolation、GIMM-VFI には対応モデルが必要です。"
       },
       "frames_per_chunk": {
         "name": "chunk ごとの新規フレーム数",
@@ -164,6 +164,14 @@
       "frame_load_cap": {
         "name": "処理フレーム上限",
         "tooltip": "0 は動画末尾まで処理します。"
+      },
+      "shared_gpu_guard": {
+        "name": "実行中VRAM保護",
+        "tooltip": "共有GPU向け。auto/on はチャンク間だけ空きVRAMを保持し、各 VSRFI チャンクの前に解放します。off で無効化します。"
+      },
+      "shared_gpu_guard_buffer_mb": {
+        "name": "保留VRAM(MB)",
+        "tooltip": "保護中に ComfyUI と瞬間的なスパイク用として残す空きVRAM。4096から開始し、実行中freeが2GB未満に落ちる場合は6144または8192へ上げます。"
       }
     }
   },

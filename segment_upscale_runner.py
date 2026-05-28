@@ -2862,8 +2862,156 @@ def _sur_load_vsrfi_stream_class():
     return _sur_load_vsrfi_stream_module().VSRFINode
 
 
-def _sur_make_bridge_vsrfi_node(vsrfi_module, base_cls, bridge_frames: int):
+_SUR_STREAM_GUARD_MODES = ("auto", "on", "off")
+
+
+def _sur_stream_guard_mode(value) -> str:
+    mode = str(value or "auto").strip().lower()
+    if mode in ("1", "true", "yes", "y", "enable", "enabled", "on"):
+        return "on"
+    if mode in ("0", "false", "no", "n", "disable", "disabled", "none", "off"):
+        return "off"
+    return "auto"
+
+
+class _SURChunkGapVramGuard:
+    def __init__(self, torch, device, mode="auto", buffer_mb=4096, chunk_mb=512):
+        self.torch = torch
+        self.mode = _sur_stream_guard_mode(mode)
+        self.buffer_bytes = max(0, int(buffer_mb or 0)) * 1024 * 1024
+        self.chunk_bytes = max(64, int(chunk_mb or 512)) * 1024 * 1024
+        self.min_chunk_bytes = 64 * 1024 * 1024
+        self.holders = []
+        self.held_bytes = 0
+        self.device = self._resolve_device(device)
+        self.enabled = self._is_enabled()
+        self._skip_logged = False
+
+    def _resolve_device(self, device):
+        try:
+            resolved = self.torch.device(device)
+        except Exception:
+            resolved = self.torch.device("cuda")
+        if resolved.type == "cuda" and resolved.index is None:
+            try:
+                resolved = self.torch.device(f"cuda:{self.torch.cuda.current_device()}")
+            except Exception:
+                pass
+        return resolved
+
+    def _is_enabled(self):
+        if self.mode == "off":
+            return False
+        try:
+            if self.device.type != "cuda" or not self.torch.cuda.is_available():
+                return False
+        except Exception:
+            return False
+        return True
+
+    @staticmethod
+    def _fmt(num_bytes: int) -> str:
+        value = float(max(0, num_bytes))
+        if value >= 1024 ** 3:
+            return f"{value / (1024 ** 3):.1f}GB"
+        return f"{value / (1024 ** 2):.0f}MB"
+
+    def _mem_get_info(self):
+        try:
+            return self.torch.cuda.mem_get_info(self.device)
+        except TypeError:
+            with self.torch.cuda.device(self.device):
+                return self.torch.cuda.mem_get_info()
+
+    def release(self, reason="before chunk"):
+        if not self.holders:
+            return
+        held = self.held_bytes
+        self.holders.clear()
+        self.held_bytes = 0
+        try:
+            self.torch.cuda.synchronize(self.device)
+        except Exception:
+            pass
+        gc.collect()
+        try:
+            self.torch.cuda.empty_cache()
+        except Exception:
+            pass
+        print(f"[SUR Stream Guard] released {self._fmt(held)} {reason}")
+
+    def acquire(self, reason="chunk gap"):
+        if not self.enabled or self.holders:
+            return
+        try:
+            free_bytes, _ = self._mem_get_info()
+        except Exception as e:
+            if not self._skip_logged:
+                print(f"[SUR Stream Guard] disabled: cannot read CUDA memory info ({type(e).__name__}: {e})")
+                self._skip_logged = True
+            return
+
+        target_bytes = int(free_bytes) - self.buffer_bytes
+        if target_bytes < self.min_chunk_bytes:
+            if not self._skip_logged:
+                print(
+                    f"[SUR Stream Guard] skip hold: free={self._fmt(int(free_bytes))}, "
+                    f"buffer={self._fmt(self.buffer_bytes)}"
+                )
+                self._skip_logged = True
+            return
+
+        held = 0
+        remaining = target_bytes
+        last_error = None
+        while remaining >= self.min_chunk_bytes:
+            request = min(self.chunk_bytes, remaining)
+            allocated = False
+            while request >= self.min_chunk_bytes:
+                try:
+                    holder = self.torch.empty((int(request),), dtype=self.torch.uint8, device=self.device)
+                    self.holders.append(holder)
+                    held += int(request)
+                    remaining -= int(request)
+                    allocated = True
+                    break
+                except RuntimeError as e:
+                    last_error = e
+                    try:
+                        self.torch.cuda.empty_cache()
+                    except Exception:
+                        pass
+                    request //= 2
+            if not allocated:
+                break
+
+        self.held_bytes = held
+        if held > 0:
+            try:
+                free_after, _ = self._mem_get_info()
+                free_text = self._fmt(int(free_after))
+            except Exception:
+                free_text = "?"
+            print(
+                f"[SUR Stream Guard] holding {self._fmt(held)} during {reason}; "
+                f"free={free_text}, buffer={self._fmt(self.buffer_bytes)}"
+            )
+            self._skip_logged = False
+        elif last_error is not None and not self._skip_logged:
+            print(f"[SUR Stream Guard] hold failed: {type(last_error).__name__}: {last_error}")
+            self._skip_logged = True
+
+
+def _sur_make_bridge_vsrfi_node(
+    vsrfi_module,
+    base_cls,
+    bridge_frames: int,
+    chunk_gap_guard="auto",
+    chunk_gap_guard_buffer_mb=4096,
+):
     bridge_frames = max(0, int(bridge_frames or 0))
+    chunk_gap_guard = _sur_stream_guard_mode(chunk_gap_guard)
+    chunk_gap_guard_buffer_mb = max(0, int(chunk_gap_guard_buffer_mb or 0))
 
     class _SURBridgeVSRFINode(base_cls):
         def process_video(
@@ -2880,7 +3028,7 @@ def _sur_make_bridge_vsrfi_node(vsrfi_module, base_cls, bridge_frames: int):
             skip_first_frames=0,
             frame_load_cap=0,
         ):
-            if bridge_frames <= 0:
+            if bridge_frames <= 0 and chunk_gap_guard == "off":
                 return super().process_video(
                     input_path,
                     output_path,
@@ -2909,6 +3057,8 @@ def _sur_make_bridge_vsrfi_node(vsrfi_module, base_cls, bridge_frames: int):
                 skip_first_frames,
                 frame_load_cap,
                 bridge_frames,
+                chunk_gap_guard,
+                chunk_gap_guard_buffer_mb,
             )
 
     return _SURBridgeVSRFINode()
@@ -2929,6 +3079,8 @@ def _sur_vsrfi_process_video_with_bridge(
     skip_first_frames=0,
     frame_load_cap=0,
     bridge_frames=1,
+    chunk_gap_guard="auto",
+    chunk_gap_guard_buffer_mb=4096,
 ):
     cv2 = vsrfi_module.cv2
     np = vsrfi_module.np
@@ -3018,6 +3170,20 @@ def _sur_vsrfi_process_video_with_bridge(
     output_frames_written = 0
     was_cancelled = False
     tqdm_bar = None
+    chunk_gap_guard = _sur_stream_guard_mode(chunk_gap_guard)
+    gap_guard = _SURChunkGapVramGuard(
+        torch,
+        device,
+        mode=chunk_gap_guard,
+        buffer_mb=chunk_gap_guard_buffer_mb,
+    )
+    if gap_guard.enabled:
+        print(
+            f"[SUR Stream Guard] mode={chunk_gap_guard} buffer={int(chunk_gap_guard_buffer_mb or 0)}MB; "
+            "holding only between chunks"
+        )
+    elif chunk_gap_guard != "off":
+        print("[SUR Stream Guard] disabled: CUDA device is not available for this stream")
 
     def _check_interrupt():
         if comfy_mod is not None:
@@ -3033,6 +3199,7 @@ def _sur_vsrfi_process_video_with_bridge(
     def _write_chunk(work_buffer, new_count: int):
         nonlocal carry, frames_processed, output_frames_written
         carry_len = len(carry)
+        gap_guard.release("before VSRFI chunk")
         chunk = node._process_chunk(
             work_buffer,
             scale,
@@ -3064,8 +3231,10 @@ def _sur_vsrfi_process_video_with_bridge(
         del chunk
         clean_vram()
         gc.collect()
+        gap_guard.acquire("chunk gap")
 
     try:
+        gap_guard.acquire("pre-chunk gap")
         with tqdm(total=total, desc="Processing frames") as tqdm_bar:
             for _ in range(total):
                 _check_interrupt()
@@ -3155,6 +3324,7 @@ def _sur_vsrfi_process_video_with_bridge(
                         pass
 
         print(f"[SUR Stream] Source frames processed: {frames_processed}; output frames written: {output_frames_written}")
+        gap_guard.release("at stream exit")
         if was_cancelled and comfy_mod is not None:
             print("[INFO] Partial video saved successfully.")
             raise comfy_mod.model_management.InterruptProcessingException()
@@ -3293,6 +3463,25 @@ class SegmentVSRFIStreamRunner:
                         "tooltip": "最多处理多少源帧。0 表示从 skip_first_frames 开始处理到视频结束。",
                     },
                 ),
+                "shared_gpu_guard": (
+                    list(_SUR_STREAM_GUARD_MODES),
+                    {
+                        "default": "auto",
+                        "display_name": "运行中占位保护",
+                        "tooltip": "共享 GPU 环境使用。auto/on 会在 chunk 间隙占住空闲显存，并在每个 VSRFI chunk 前释放；off 关闭。",
+                    },
+                ),
+                "shared_gpu_guard_buffer_mb": (
+                    "INT",
+                    {
+                        "default": 4096,
+                        "min": 0,
+                        "max": 65536,
+                        "step": 256,
+                        "display_name": "占位保留显存(MB)",
+                        "tooltip": "运行中占位时留给 ComfyUI 和瞬时波动的空闲显存。建议 4096；如果运行中 free 经常低于 2GB，可提高到 6144 或 8192。",
+                    },
+                ),
             },
             "hidden": {"unique_id": "UNIQUE_ID"},
         }
@@ -3321,6 +3510,8 @@ class SegmentVSRFIStreamRunner:
         max_gimm_kilopixels=0,
         skip_first_frames=0,
         frame_load_cap=0,
+        shared_gpu_guard="auto",
+        shared_gpu_guard_buffer_mb=4096,
         unique_id=None,
     ):
         uid = unique_id
@@ -3338,6 +3529,8 @@ class SegmentVSRFIStreamRunner:
         max_gimm_kilopixels = max(0, int(max_gimm_kilopixels or 0))
         skip_first_frames = max(0, int(skip_first_frames or 0))
         frame_load_cap = max(0, int(frame_load_cap or 0))
+        shared_gpu_guard = _sur_stream_guard_mode(shared_gpu_guard)
+        shared_gpu_guard_buffer_mb = max(0, int(shared_gpu_guard_buffer_mb or 0))
         vfi_method = str(vfi_method or _sur_default_vfi_method())
 
         if not video_path:
@@ -3364,6 +3557,7 @@ class SegmentVSRFIStreamRunner:
             )
         log(f"  max_tile_kilopixels={max_tile_kilopixels}  max_gimm_kilopixels={max_gimm_kilopixels}")
         log(f"  skip_first_frames={skip_first_frames}  frame_load_cap={frame_load_cap}")
+        log(f"  shared_gpu_guard={shared_gpu_guard}  guard_buffer={shared_gpu_guard_buffer_mb}MB")
 
         if not _sur_bool(execute, False):
             log("Preview only. Set execute=True to start the stream job.")
@@ -3372,7 +3566,18 @@ class SegmentVSRFIStreamRunner:
         try:
             vsrfi_module = _sur_load_vsrfi_stream_module()
             vsrfi_cls = vsrfi_module.VSRFINode
-            vsrfi_node = _sur_make_bridge_vsrfi_node(vsrfi_module, vsrfi_cls, bridge_frames) if bridge_frames > 0 else vsrfi_cls()
+            use_stream_wrapper = bridge_frames > 0 or shared_gpu_guard != "off"
+            vsrfi_node = (
+                _sur_make_bridge_vsrfi_node(
+                    vsrfi_module,
+                    vsrfi_cls,
+                    bridge_frames,
+                    shared_gpu_guard,
+                    shared_gpu_guard_buffer_mb,
+                )
+                if use_stream_wrapper
+                else vsrfi_cls()
+            )
             out = vsrfi_node.process(
                 video_path,
                 output_path,

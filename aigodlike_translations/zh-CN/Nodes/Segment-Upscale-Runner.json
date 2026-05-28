@@ -50,7 +50,9 @@
       "max_tile_kilopixels": "最大瓦片千像素",
       "max_gimm_kilopixels": "最大 GIMM 千像素",
       "skip_first_frames": "跳过开头帧",
-      "frame_load_cap": "处理帧数上限"
+      "frame_load_cap": "处理帧数上限",
+      "shared_gpu_guard": "运行中占位保护",
+      "shared_gpu_guard_buffer_mb": "占位保留显存(MB)"
     }
   },
   "SegmentFrameTrimmer": {

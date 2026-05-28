@@ -139,7 +139,7 @@
       },
       "vfi_method": {
         "name": "VFI Method",
-        "tooltip": "GIMM-VFI by default. RIFE/FILM require ComfyUI-Frame-Interpolation."
+        "tooltip": "Defaults to RIFE when available. RIFE/FILM require ComfyUI-Frame-Interpolation; GIMM-VFI requires its model directory."
       },
       "frames_per_chunk": {
         "name": "Frames Per Chunk",
@@ -164,6 +164,14 @@
       "frame_load_cap": {
         "name": "Frame Load Cap",
         "tooltip": "0 processes the rest of the video."
+      },
+      "shared_gpu_guard": {
+        "name": "Chunk-Gap Guard",
+        "tooltip": "For shared GPUs. auto/on holds free VRAM between chunks and releases before every VSRFI chunk; off disables it."
+      },
+      "shared_gpu_guard_buffer_mb": {
+        "name": "Guard Buffer (MB)",
+        "tooltip": "Free VRAM left for ComfyUI and short spikes while the guard is holding memory. Start with 4096; raise to 6144 or 8192 if runtime free VRAM often falls below 2GB."
       }
     }
   },

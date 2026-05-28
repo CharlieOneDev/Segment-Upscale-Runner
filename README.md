@@ -49,6 +49,8 @@ max_tile_kilopixels     0 表示让 VSRFI 根据显存自动选择瓦片大小
 max_gimm_kilopixels     0 表示让 GIMM-VFI 自动选择光流限制
 skip_first_frames       从源视频开头跳过多少帧
 frame_load_cap          0 表示处理到视频结尾
+shared_gpu_guard        共享 GPU 运行中占位保护；默认 auto
+shared_gpu_guard_buffer_mb 运行中占位时保留的空闲显存；默认 4096
 ```
 
 视频输入：
@@ -69,6 +71,8 @@ frames_per_chunk        = 19
 bridge_frames           = 1
 max_tile_kilopixels     = 6300  # 更保守；显存很稳定时可改回 0 自动
 max_gimm_kilopixels     = 0
+shared_gpu_guard        = auto
+shared_gpu_guard_buffer_mb = 4096
 frame_load_cap          = 0
 ```
 
@@ -91,6 +95,38 @@ effective        = 19 + 1 = 20
 如果 chunk 边界仍有闪烁或轻微跳变，可以试 `18/2`，它仍然是 `18 + 2 = 20`。桥接帧越多，边界上下文越多，但重复处理也越多，速度会下降。
 
 RIFE 是默认推荐的插帧方式：它速度快、显存曲线更容易预测，适合长视频流式任务。GIMM-VFI 仍可选，适合你更看重运动质量、并且显存余量足够的场景。
+
+### 运行中 chunk 间隙显存保护
+
+`SUR VSRFI Stream Runner` 内置 `shared_gpu_guard`，默认 `auto`。它和外部 `vram_guard.py` 分工不同：
+
+```text
+外部 vram_guard.py      保护 ComfyUI 空闲期
+shared_gpu_guard        保护当前流式任务的 chunk 间隙
+```
+
+运行方式是：
+
+```text
+读源帧 / 写出 / 音频 mux 等 CPU 间隙：占住空闲 VRAM
+每个 VSRFI chunk 开始前：释放占位张量并 empty_cache()
+FlashVSR / VFI 正在计算：不占位，把显存留给 ComfyUI
+chunk 完成并清理后：重新占位，直到下一个 chunk
+```
+
+这层保护不能降低单个 chunk 内部的峰值，也不能阻止别人已经占住的显存；它防的是“你的 chunk 刚释放出显存，别的进程趁下一块开始前抢走”的时间窗。因此它要和稳定 chunk 设置一起使用，推荐 `19/1` 和固定 `max_tile_kilopixels`。
+
+`shared_gpu_guard_buffer_mb` 是占位时留出来的安全余量。默认 `4096` 比较平衡；如果日志里运行时 `free=` 经常掉到 2GB 以下，可以改成 `6144` 或 `8192`。如果你在独占 GPU 或本地调试，不想要任何额外占位，把 `shared_gpu_guard=off` 即可。
+
+运行日志里可以这样判断：
+
+```text
+[SUR Stream Guard] mode=auto buffer=4096MB; holding only between chunks
+[SUR Stream Guard] holding 28.0GB during chunk gap; free=4.0GB, buffer=4.0GB
+[SUR Stream Guard] released 28.0GB before VSRFI chunk
+```
+
+看到 `holding` 和下一块前的 `released` 成对出现，就说明运行中占位保护在工作。
 
 ## 流式桥接帧怎么工作
 
@@ -166,7 +202,7 @@ python3 custom_nodes/Comfyui-Segment-Upscale-Runner/tools/vram_guard.py \
 [release] queue=busy ... guard(pid=-)
 ```
 
-表示 ComfyUI 开始工作，占位进程已释放。这时脚本不会再保护运行中的 ComfyUI；如果其他进程在你运行时抢显存，只能靠降低自己的峰值来留余量。
+表示 ComfyUI 开始工作，占位进程已释放。外部脚本不会再保护运行中的 ComfyUI；`SUR VSRFI Stream Runner` 的 `shared_gpu_guard=auto` 会继续保护 chunk 间隙，但 chunk 内部仍然只能靠 `19/1`、固定 tile 和足够 buffer 来留余量。
 
 运行中建议盯 `free=`：
 

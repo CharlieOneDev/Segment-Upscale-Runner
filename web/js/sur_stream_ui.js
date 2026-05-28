@@ -61,8 +61,9 @@ const I18N = {
         previewUnavailable: "预览仅支持 input/output/temp 内的视频；完整路径仍可手动输入。",
         helpTitle: "SUR 流式处理",
         helpLines: [
-            "推荐共享 GPU 起步：RIFE，scale=2，插帧=2，chunk=19，桥接=1。",
+            "推荐共享 GPU 起步：RIFE，scale=2，插帧=2，chunk=19，桥接=1，运行中占位=auto。",
             "19/1 会让非首块实际送入 FlashVSR 的帧数保持为 20，接近 VSRFI 参考设置。",
+            "运行中占位只在 chunk 间隙持有显存；每个 VSRFI chunk 开始前会释放。",
         ],
         widgets: {
             video_path: "视频文件",
@@ -77,6 +78,8 @@ const I18N = {
             max_gimm_kilopixels: "GIMM分块上限",
             skip_first_frames: "跳过开头帧",
             frame_load_cap: "最多处理帧",
+            shared_gpu_guard: "运行中占位保护",
+            shared_gpu_guard_buffer_mb: "占位保留显存(MB)",
         },
     },
     ja: {
@@ -88,8 +91,9 @@ const I18N = {
         previewUnavailable: "プレビューは input/output/temp 内の動画のみ対応します。フルパスは手入力できます。",
         helpTitle: "SUR Stream",
         helpLines: [
-            "Shared GPU baseline: RIFE, scale=2, interpolation=2, chunk=19, bridge=1.",
+            "Shared GPU baseline: RIFE, scale=2, interpolation=2, chunk=19, bridge=1, guard=auto.",
             "19/1 keeps non-first FlashVSR chunks at 20 frames, close to the reference VSRFI setup.",
+            "The guard holds VRAM only between chunks and releases before each VSRFI chunk.",
         ],
         widgets: {
             video_path: "動画ファイル",
@@ -104,6 +108,8 @@ const I18N = {
             max_gimm_kilopixels: "GIMM 上限",
             skip_first_frames: "先頭スキップ",
             frame_load_cap: "処理上限",
+            shared_gpu_guard: "実行中VRAM保護",
+            shared_gpu_guard_buffer_mb: "保留VRAM(MB)",
         },
     },
     en: {
@@ -115,8 +121,9 @@ const I18N = {
         previewUnavailable: "Preview works for videos under input/output/temp; full paths can still be typed.",
         helpTitle: "SUR Stream",
         helpLines: [
-            "Shared-GPU baseline: RIFE, scale=2, interpolation=2, chunk=19, bridge=1.",
+            "Shared-GPU baseline: RIFE, scale=2, interpolation=2, chunk=19, bridge=1, guard=auto.",
             "19/1 keeps non-first FlashVSR chunks at 20 frames, close to the reference VSRFI setup.",
+            "The guard holds VRAM only between chunks and releases before each VSRFI chunk.",
         ],
         widgets: {
             video_path: "Video File",
@@ -131,6 +138,8 @@ const I18N = {
             max_gimm_kilopixels: "GIMM Limit",
             skip_first_frames: "Skip Frames",
             frame_load_cap: "Frame Cap",
+            shared_gpu_guard: "Chunk-Gap Guard",
+            shared_gpu_guard_buffer_mb: "Guard Buffer (MB)",
         },
     },
 };

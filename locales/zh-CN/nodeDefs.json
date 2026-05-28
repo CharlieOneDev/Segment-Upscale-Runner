@@ -139,7 +139,7 @@
       },
       "vfi_method": {
         "name": "插帧方法",
-        "tooltip": "默认 GIMM-VFI。RIFE/FILM 需要安装 ComfyUI-Frame-Interpolation。"
+        "tooltip": "默认优先 RIFE。RIFE/FILM 需要安装 ComfyUI-Frame-Interpolation；GIMM-VFI 需要对应模型目录。"
       },
       "frames_per_chunk": {
         "name": "每块源帧数",
@@ -164,6 +164,14 @@
       "frame_load_cap": {
         "name": "处理帧数上限",
         "tooltip": "0 表示处理到视频结尾。"
+      },
+      "shared_gpu_guard": {
+        "name": "运行中占位保护",
+        "tooltip": "共享 GPU 环境使用。auto/on 会在 chunk 间隙占住空闲显存，并在每个 VSRFI chunk 前释放；off 关闭。"
+      },
+      "shared_gpu_guard_buffer_mb": {
+        "name": "占位保留显存(MB)",
+        "tooltip": "运行中占位时留给 ComfyUI 和瞬时波动的空闲显存。建议 4096；如果运行中 free 经常低于 2GB，可提高到 6144 或 8192。"
       }
     }
   },
