@@ -187,10 +187,13 @@ function localizeWidgetLabels(node) {
         if (!label) {
             continue;
         }
-        widget.label = label;
-        widget.displayName = label;
-        widget.options = widget.options ?? {};
-        widget.options.label = label;
+        try {
+            widget.label = label;
+        } catch (_) {}
+        try {
+            widget.options = widget.options ?? {};
+            widget.options.label = label;
+        } catch (_) {}
     }
 }
 
