@@ -1830,6 +1830,45 @@ def _clear_comfy_execution_cache(log=None, reset_executors: bool = True):
     return cleared_entries
 
 
+def _sur_post_segment_cache_purge(log=None, trim_working_set: bool = True):
+    """Release per-prompt execution state after a child segment finishes."""
+    torch = _sur_import_torch()
+    before_ram = _sur_ram_gb()
+    before_vram = _sur_vram_gb(torch)
+    cleared = _clear_comfy_execution_cache(log=None, reset_executors=True)
+
+    try:
+        if torch and torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
+            torch.cuda.synchronize()
+    except Exception:
+        pass
+
+    collected = 0
+    try:
+        collected += gc.collect()
+        collected += gc.collect()
+    except Exception:
+        pass
+
+    os_trimmed = False
+    if trim_working_set:
+        os_trimmed = _sur_trim_ram_os()
+
+    after_ram = _sur_ram_gb()
+    after_vram = _sur_vram_gb(torch)
+    if log:
+        log(
+            "  段后内部缓存清理: "
+            f"cache={cleared}  gc={collected}  "
+            f"RAM={before_ram:.2f}->{after_ram:.2f}GB  "
+            f"VRAM={before_vram:.2f}->{after_vram:.2f}GB  "
+            f"WindowsTrim={'开' if os_trimmed else '跳过/不可用'}"
+        )
+    return cleared
+
+
 # ── 工具函数 ──────────────────────────────────────────────────────
 
 def _now_stamp() -> str:
@@ -2565,6 +2604,7 @@ class SegmentUpscaleRunner:
                     f"history清理={'开' if clear_segment_history else '关'}"
                     + f"  跳过预览/调试旁路={'开' if prune_cleanup_debug_nodes else '关'}"
                     + f"  自动合并={'开' if merge_segments else '关'}"
+                    + f"  物理分片段后缓存清理={'开' if physical_mode else '关'}"
                 )
 
                 physical_slices: dict[int, dict[str, str]] = {}
@@ -2728,6 +2768,8 @@ class SegmentUpscaleRunner:
                         log(f"✗ 第{seg_num}段提交失败: {type(e).__name__}: {e}")
                     finally:
                         wf = None
+                        if pid and physical_mode:
+                            _sur_post_segment_cache_purge(log=log, trim_working_set=True)
 
                     if segment_failed:
                         break

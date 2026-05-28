@@ -71,7 +71,7 @@ VHS_LoadVideo.images
 
 如果使用 `VHS_LoadVideoFFmpeg`，Runner 会自动把 `load_skip` 换算成 `start_time = 原始 start_time + load_skip / frame_rate`，并写入 `frame_load_cap`。如果使用普通 `VHS_LoadVideo`，Runner 会保留原始 `skip_first_frames` 作为基础偏移，再叠加每段自己的 `load_skip`。如果节点 ID 填错或填到了错误类型的节点，但图里只有一个对应节点，Runner 会自动纠正并在日志里提示。
 
-Runner 会把每段子任务提交给当前浏览器客户端，ComfyUI 前端应能继续显示子任务正在执行的节点；日志中也会显示 `前端执行状态转发=开/关`。本插件不再提供段间 RAM/VRAM 深度清理功能，因为 Windows 主进程的 Private Commit 通常不能靠工作流节点可靠归还。当前策略是减少无效大张量生成，让每段更容易回到稳定内存平台。
+Runner 会把每段子任务提交给当前浏览器客户端，ComfyUI 前端应能继续显示子任务正在执行的节点；日志中也会显示 `前端执行状态转发=开/关`。本插件不再提供单独的 RAM/VRAM 深度清理节点；在 `physical_slices` 模式下，Runner 会在每段结束后自动清理 ComfyUI execution cache、执行 GC/CUDA cache 回收，并在 Windows 上请求一次 working-set trim。它能减少引用残留和物理内存压力，但 Windows 主进程的 Private Commit 不保证立刻下降。
 
 如果使用 `AIGODLIKE-COMFYUI-TRANSLATION` 中文包，它不会读取本插件的 `locales` 目录。可将 `aigodlike_translations/zh-CN/Nodes/Segment-Upscale-Runner.json` 复制到中文包的 `zh-CN/Nodes/` 目录，然后重启 ComfyUI。
 
