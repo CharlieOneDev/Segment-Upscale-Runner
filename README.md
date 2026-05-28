@@ -30,7 +30,7 @@
 
 - 已安装 `custom_nodes/VSRFI-ComfyUI`。
 - VSRFI 的 `requirements.txt` 已安装到同一个 ComfyUI venv。
-- `models/FlashVSR-v1.1` 存在。
+- `models/FlashVSR-v1.1` 存在。本节点使用的就是 FlashVSR-v1.1，核心权重为 `diffusion_pytorch_model_streaming_dmd.safetensors`，并配合该目录下的 `TCDecoder.ckpt`、`LQ_proj_in.ckpt`。
 - 使用 `GIMM-VFI` 时，`models/interpolation/gimm-vfi` 存在。
 - `ffmpeg` 和 `ffprobe` 在 PATH 中可用。
 - 如果要用 `RIFE` 或 `FILM`，还需要 `ComfyUI-Frame-Interpolation`。
@@ -38,7 +38,7 @@
 常用参数：
 
 ```text
-video_path              输入视频路径，或 ComfyUI/input 下的文件名
+video_path              输入视频路径，或 ComfyUI/input 下的文件名；节点里的“选择/上传视频”按钮会自动填入
 output_path             输出 mp4 路径；留空则输出到 output/VSRFI
 scale                   放大倍率；0 表示只插帧不放大
 interpolation_factor    插帧倍率；25fps 配 2 会输出 50fps
@@ -50,6 +50,12 @@ max_gimm_kilopixels     0 表示让 GIMM-VFI 自动选择光流限制
 skip_first_frames       从源视频开头跳过多少帧
 frame_load_cap          0 表示处理到视频结尾
 ```
+
+视频输入：
+
+- 点节点上的“选择/上传视频”会把视频上传到 ComfyUI 的 `input` 目录，并把返回文件名写入 `video_path`。
+- 已经在 `input` 里的文件，可以直接填文件名，例如 `demo.mp4`。
+- 也可以填完整路径，但为了工作流可迁移，优先推荐上传或放到 `input`。
 
 12GB 显存的起步建议：
 

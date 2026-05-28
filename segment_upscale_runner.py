@@ -3169,21 +3169,26 @@ class SegmentVSRFIStreamRunner:
                     "STRING",
                     {
                         "default": "",
-                        "tooltip": "Input video path, or a filename relative to ComfyUI/input.",
+                        "placeholder": "input 中的视频文件名，或完整路径",
+                        "display_name": "视频文件",
+                        "tooltip": "输入视频。可填写 ComfyUI/input 下的文件名、相对路径或完整路径；也可以点节点里的“选择/上传视频”。",
                     },
                 ),
                 "output_path": (
                     "STRING",
                     {
                         "default": "",
-                        "tooltip": "Output mp4 path. Leave blank to use output/VSRFI/<input>_VSRFI.mp4.",
+                        "placeholder": "留空自动输出到 output/VSRFI",
+                        "display_name": "输出路径",
+                        "tooltip": "输出 mp4 路径。留空时自动保存到 output/VSRFI/<输入文件名>_VSRFI.mp4。",
                     },
                 ),
                 "execute": (
                     "BOOLEAN",
                     {
                         "default": False,
-                        "tooltip": "False only prints the planned stream job; True starts processing.",
+                        "display_name": "开始执行",
+                        "tooltip": "False 只预览参数；True 才开始流式放大/插帧。",
                     },
                 ),
                 "scale": (
@@ -3193,7 +3198,8 @@ class SegmentVSRFIStreamRunner:
                         "min": 0,
                         "max": 16,
                         "step": 1,
-                        "tooltip": "Spatial scale. 0 skips upscaling and only runs interpolation.",
+                        "display_name": "放大倍率",
+                        "tooltip": "空间放大倍率。2 表示宽高各放大 2 倍；0 表示不放大，只做插帧。",
                     },
                 ),
                 "interpolation_factor": (
@@ -3203,14 +3209,16 @@ class SegmentVSRFIStreamRunner:
                         "min": 0,
                         "max": 16,
                         "step": 1,
-                        "tooltip": "FPS multiplier. 2 turns 25fps into 50fps. Values below 2 skip interpolation.",
+                        "display_name": "插帧倍率",
+                        "tooltip": "帧率倍率。2 会把 25fps 变成 50fps；小于 2 时跳过插帧。",
                     },
                 ),
                 "vfi_method": (
                     _sur_vsrfi_vfi_methods(),
                     {
                         "default": "GIMM-VFI",
-                        "tooltip": "RIFE/FILM appear only when ComfyUI-Frame-Interpolation is installed.",
+                        "display_name": "插帧方法",
+                        "tooltip": "插帧模型。RIFE/FILM 需要安装 ComfyUI-Frame-Interpolation；GIMM-VFI 需要对应模型目录。",
                     },
                 ),
                 "frames_per_chunk": (
@@ -3220,7 +3228,8 @@ class SegmentVSRFIStreamRunner:
                         "min": 1,
                         "max": 100000,
                         "step": 1,
-                        "tooltip": "How many new source frames to process per chunk. Lower is safer for RAM/VRAM.",
+                        "display_name": "每块源帧数",
+                        "tooltip": "每次处理的新源帧数量。越小越省 RAM/VRAM，但速度更慢；12GB 显存可先用 21。",
                     },
                 ),
                 "bridge_frames": (
@@ -3230,7 +3239,8 @@ class SegmentVSRFIStreamRunner:
                         "min": 0,
                         "max": 64,
                         "step": 1,
-                        "tooltip": "Previous-tail source frames carried into the next chunk. 1 preserves VFI boundary interpolation; 4-8 gives FlashVSR more context.",
+                        "display_name": "桥接帧",
+                        "tooltip": "把上一块末尾的源帧带入下一块。1 可保留边界插帧；4-8 会给 FlashVSR 更多时序上下文，但会稍慢。",
                     },
                 ),
                 "max_tile_kilopixels": (
@@ -3240,7 +3250,8 @@ class SegmentVSRFIStreamRunner:
                         "min": 0,
                         "max": 100000,
                         "step": 1,
-                        "tooltip": "VSR tile limit. 0 lets VSRFI auto-pick from available VRAM.",
+                        "display_name": "VSR分块上限",
+                        "tooltip": "放大模型的 tile 输入像素上限，单位千像素。0 表示让 VSRFI 根据显存自动选择。",
                     },
                 ),
                 "max_gimm_kilopixels": (
@@ -3250,12 +3261,20 @@ class SegmentVSRFIStreamRunner:
                         "min": 0,
                         "max": 100000,
                         "step": 1,
-                        "tooltip": "GIMM-VFI flow limit. 0 lets VSRFI auto-pick.",
+                        "display_name": "GIMM分块上限",
+                        "tooltip": "GIMM-VFI 光流/插帧分块上限，单位千像素。0 表示自动选择。",
                     },
                 ),
                 "skip_first_frames": (
                     "INT",
-                    {"default": 0, "min": 0, "max": 999999, "step": 1},
+                    {
+                        "default": 0,
+                        "min": 0,
+                        "max": 999999,
+                        "step": 1,
+                        "display_name": "跳过开头帧",
+                        "tooltip": "从输入视频开头跳过多少源帧后再开始处理。",
+                    },
                 ),
                 "frame_load_cap": (
                     "INT",
@@ -3264,7 +3283,8 @@ class SegmentVSRFIStreamRunner:
                         "min": 0,
                         "max": 999999,
                         "step": 1,
-                        "tooltip": "0 processes the rest of the video.",
+                        "display_name": "最多处理帧",
+                        "tooltip": "最多处理多少源帧。0 表示从 skip_first_frames 开始处理到视频结束。",
                     },
                 ),
             },
@@ -3478,4 +3498,3 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "SegmentVideoInfoProbe": "Segment Video Info Probe",
     "SegmentVSRFIStreamRunner": "SUR VSRFI Stream Runner",
 }
-
