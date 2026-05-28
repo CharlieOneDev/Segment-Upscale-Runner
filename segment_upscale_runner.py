@@ -1833,9 +1833,15 @@ def _clear_comfy_execution_cache(log=None, reset_executors: bool = True):
 def _sur_post_segment_cache_purge(log=None, trim_working_set: bool = True):
     """Release per-prompt execution state after a child segment finishes."""
     torch = _sur_import_torch()
+    lines: list[str] = []
     before_ram = _sur_ram_gb()
     before_vram = _sur_vram_gb(torch)
     cleared = _clear_comfy_execution_cache(log=None, reset_executors=True)
+    video_cleared = _sur_aggressive_clear_video_tensors(
+        lines,
+        size_threshold_gb=0.25,
+        max_shapes=10,
+    )
 
     try:
         if torch and torch.cuda.is_available():
@@ -1861,11 +1867,13 @@ def _sur_post_segment_cache_purge(log=None, trim_working_set: bool = True):
     if log:
         log(
             "  段后内部缓存清理: "
-            f"cache={cleared}  gc={collected}  "
+            f"cache={cleared}  video_tensor={video_cleared}  gc={collected}  "
             f"RAM={before_ram:.2f}->{after_ram:.2f}GB  "
             f"VRAM={before_vram:.2f}->{after_vram:.2f}GB  "
             f"WindowsTrim={'开' if os_trimmed else '跳过/不可用'}"
         )
+        for line in lines:
+            log(line)
     return cleared
 
 
