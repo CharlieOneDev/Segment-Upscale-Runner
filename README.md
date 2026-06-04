@@ -10,6 +10,7 @@
 ## 节点
 
 - `Segment Upscale Runner`：通用分段队列。
+- `Wan2.2 I2V Segment Runner`：标准 Wan2.2 high/low 图生视频长视频分段队列。
 - `SUR VSRFI Stream Runner`：流式 FlashVSR + VFI 长视频处理。
 - `Segment Final Frame Trimmer`：通用分段模式下，保存前裁掉重复桥接输出帧。
 - `Segment VFI Bridge Trimmer`：通用分段模式下，在 VFI 前只保留必要桥接帧。
@@ -20,7 +21,33 @@
 
 长视频放大插帧：优先用 `SUR VSRFI Stream Runner`。
 
+标准 Wan2.2 high/low 图生视频续写：用 `Wan2.2 I2V Segment Runner`。
+
 普通工作流分段执行：用 `Segment Upscale Runner`。
+
+## Wan2.2 I2V Segment Runner
+
+这个节点给标准 `WanImageToVideo -> high/low KSampler -> VAEDecode -> VHS_VideoCombine` 工作流使用，不需要填写 `LoadVideo` 节点 ID。
+
+常用设置：
+
+```text
+segment_frames    = 81
+context_frames    = 16
+frame_rate        = 16
+segment_count     = 想生成的段数
+```
+
+运行逻辑：
+
+```text
+第1段：Wan length = 81，使用原始 start_image，保存 81 帧
+第2段起：读取上一段输出视频尾部 16 帧作为 start_image
+         Wan length = 81 + 16 = 97
+         保存前自动裁掉开头 16 帧，只保留新的 81 帧
+```
+
+节点会自动在每段子 prompt 里临时插入 `Segment Final Frame Trimmer`，所以标准 Wan 工作流里可以直接让 `VAEDecode` 接到 `VHS_VideoCombine`。如果要从中断处续跑，保持 checkpoint 开启，或把已完成分段视频按顺序填入 `pre_segment_paths`，再把 `start_segment` 改到下一段。
 
 `SUR VSRFI Stream Runner` 解决的是之前最痛的地方：不再让每段结果进入 ComfyUI 的大 `IMAGE` 张量链，也不依赖 Windows 在每段后立刻回收 Python Private Commit。它的思路是少制造大对象，而不是事后强行清理。
 

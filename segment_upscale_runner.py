@@ -8,7 +8,7 @@ ComfyUI 通用视频分段加工队列节点 (Segment Upscale Runner)
 - 保存时由 SegmentFrameTrimmer 节点自动去重，合并后无重叠、无跳帧
 """
 
-import copy, ctypes, gc, hashlib, json, time, os, platform, shutil, subprocess, sys, tempfile, threading, traceback, urllib.request, urllib.error
+import copy, ctypes, gc, hashlib, json, time, os, platform, re, shutil, subprocess, sys, tempfile, threading, traceback, urllib.request, urllib.error
 import importlib.util
 import server, folder_paths
 from aiohttp import web
@@ -416,6 +416,35 @@ def _node_inputs(node: dict) -> dict:
     return inputs if isinstance(inputs, dict) else {}
 
 
+def _sur_workflow_extra(extra_info: dict) -> dict:
+    workflow = (extra_info or {}).get("workflow")
+    if isinstance(workflow, dict):
+        extra = workflow.get("extra")
+        if isinstance(extra, dict):
+            return extra
+    return {}
+
+
+def _sur_context_full_prompt(extra_info: dict, prompt):
+    wf_extra = _sur_workflow_extra(extra_info)
+    return (
+        (extra_info or {}).get("sur_full_prompt")
+        or wf_extra.get("sur_full_prompt")
+        or wf_extra.get("sur_full_prompt_api")
+        or prompt
+    )
+
+
+def _sur_context_client_id(extra_info: dict) -> str:
+    wf_extra = _sur_workflow_extra(extra_info)
+    return str(
+        (extra_info or {}).get("sur_client_id")
+        or wf_extra.get("sur_client_id")
+        or _sur_current_client_id()
+        or ""
+    )
+
+
 def _link_node_id(value):
     if isinstance(value, (list, tuple)) and len(value) >= 2:
         first = value[0]
@@ -545,6 +574,265 @@ def _node_references_any(node: dict, removed_ids: set[str]) -> bool:
             return True
     return False
 
+
+def _sur_node_sort_key(nid):
+    text = str(nid)
+    return (0, int(text)) if text.isdigit() else (1, text)
+
+
+def _sur_unique_node_id(prompt: dict, base: str) -> str:
+    base = str(base or "sur_node").strip() or "sur_node"
+    if base not in (prompt or {}):
+        return base
+    idx = 2
+    while f"{base}_{idx}" in prompt:
+        idx += 1
+    return f"{base}_{idx}"
+
+
+def _sur_prune_ids_and_dependents(prompt: dict, remove_ids) -> list[str]:
+    if not isinstance(prompt, dict):
+        return []
+    remove = {
+        str(nid)
+        for nid in (remove_ids or [])
+        if str(nid) in prompt
+    }
+    if not remove:
+        return []
+
+    changed = True
+    while changed:
+        changed = False
+        for nid, node in list(prompt.items()):
+            nid = str(nid)
+            if nid in remove:
+                continue
+            if _node_references_any(node, remove):
+                remove.add(nid)
+                changed = True
+
+    removed = []
+    for nid in sorted(remove, key=_sur_node_sort_key):
+        node = prompt.pop(nid, None)
+        if node is not None:
+            removed.append(f"{nid}:{_node_class(node)}")
+    return removed
+
+
+def _sur_remove_runner_nodes(prompt: dict) -> list[str]:
+    runner_classes = {
+        "SegmentUpscaleRunner",
+        "SegmentWanI2VRunner",
+        "SegmentVSRFIStreamRunner",
+    }
+    remove = [
+        str(nid)
+        for nid, node in (prompt or {}).items()
+        if _node_class(node) in runner_classes
+    ]
+    return _sur_prune_ids_and_dependents(prompt, remove)
+
+
+def _sur_remove_extra_video_combine_nodes(prompt: dict, keep_combine_nid: str) -> list[str]:
+    keep = str(keep_combine_nid or "").strip()
+    remove = [
+        str(nid)
+        for nid, node in (prompt or {}).items()
+        if _node_class(node) == "VHS_VideoCombine" and str(nid) != keep
+    ]
+    return _sur_prune_ids_and_dependents(prompt, remove)
+
+
+def _sur_comfy_date_format_to_strftime(fmt: str) -> str:
+    text = str(fmt or "")
+    replacements = (
+        ("yyyy", "%Y"),
+        ("YYYY", "%Y"),
+        ("yy", "%y"),
+        ("YY", "%y"),
+        ("MM", "%m"),
+        ("dd", "%d"),
+        ("DD", "%d"),
+        ("HH", "%H"),
+        ("hh", "%H"),
+        ("mm", "%M"),
+        ("ss", "%S"),
+    )
+    for src, dst in replacements:
+        text = text.replace(src, dst)
+    return text
+
+
+def _sur_expand_comfy_date_tokens(text: str) -> str:
+    raw = str(text or "")
+
+    def repl(match):
+        return time.strftime(_sur_comfy_date_format_to_strftime(match.group(1)))
+
+    return re.sub(r"%date:([^%]+)%", repl, raw)
+
+
+def _sur_safe_output_path_part(part: str) -> str:
+    safe = re.sub(r'[<>:"|?*\x00-\x1f]+', "_", str(part or "")).strip().strip(". ")
+    if not safe:
+        return ""
+    reserved = {
+        "CON", "PRN", "AUX", "NUL",
+        "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
+        "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+    }
+    return f"_{safe}" if safe.upper() in reserved else safe
+
+
+def _sur_output_subfolder_from_prefix(filename_prefix: str) -> str:
+    prefix = str(filename_prefix or "")
+    slash = max(prefix.rfind("/"), prefix.rfind("\\"))
+    if slash < 0:
+        return ""
+    subfolder = _sur_expand_comfy_date_tokens(prefix[:slash + 1])
+    parts = []
+    for part in re.split(r"[\\/]+", subfolder):
+        if not part or part in (".", ".."):
+            continue
+        safe = _sur_safe_output_path_part(part)
+        if safe:
+            parts.append(safe)
+    return "/".join(parts) + "/" if parts else ""
+
+
+def _sur_find_downstream_node_ids(
+    prompt: dict,
+    start_id: str,
+    wanted_class,
+    max_depth: int = 24,
+) -> list[str]:
+    start_id = str(start_id or "").strip()
+    if not prompt or not start_id:
+        return []
+    wanted_classes = {wanted_class} if isinstance(wanted_class, str) else set(wanted_class or [])
+    frontier = {start_id}
+    visited = set()
+    matches = []
+    for _ in range(max(1, int(max_depth or 1))):
+        next_frontier = set()
+        for nid, node in (prompt or {}).items():
+            nid = str(nid)
+            if nid in visited:
+                continue
+            if any(_link_node_id(value) in frontier for value in _node_inputs(node).values()):
+                visited.add(nid)
+                next_frontier.add(nid)
+                if _node_class(node) in wanted_classes:
+                    matches.append(nid)
+        if not next_frontier:
+            break
+        frontier = next_frontier
+    return matches
+
+
+def _sur_auto_downstream_node_id(
+    prompt: dict,
+    start_id: str,
+    current_id: str,
+    wanted_class,
+    label: str,
+    log=None,
+) -> str:
+    current_id = str(current_id or "").strip()
+    wanted_classes = {wanted_class} if isinstance(wanted_class, str) else set(wanted_class or [])
+    if current_id and current_id in (prompt or {}) and _node_class((prompt or {}).get(current_id, {})) in wanted_classes:
+        return current_id
+
+    matches = _sur_find_downstream_node_ids(prompt, start_id, wanted_classes)
+    if len(matches) == 1:
+        if log:
+            wanted_label = " / ".join(sorted(wanted_classes))
+            log(f"⚠ {label} 节点 ID「{current_id or '空'}」无效，已自动改用下游唯一的 {wanted_label} 节点 ID「{matches[0]}」")
+        return matches[0]
+    return _sur_auto_node_id(prompt, current_id, wanted_classes, label, log=log)
+
+
+def _sur_set_wan_i2v_length(wf: dict, wan_nid: str, length: int, log=None):
+    node = wf.get(str(wan_nid))
+    if not node:
+        return
+    length = max(1, int(length or 1))
+    _node_inputs(node)["length"] = length
+    if log:
+        log(f"  WanImageToVideo.length={length}")
+
+
+def _sur_inject_wan_segment_trimmer(
+    wf: dict,
+    combine_nid: str,
+    trim_frames: int,
+    tag: str,
+    log=None,
+) -> str:
+    combine = wf.get(str(combine_nid))
+    if not combine:
+        raise RuntimeError(f"找不到 VHS_VideoCombine 节点 {combine_nid}")
+    inputs = combine.setdefault("inputs", {})
+    image_source = inputs.get("images")
+    if image_source is None:
+        raise RuntimeError(f"VHS_VideoCombine 节点 {combine_nid} 没有 images 输入")
+
+    trim_frames = max(0, int(trim_frames or 0))
+    source_id = _link_node_id(image_source)
+    if source_id and _node_class(wf.get(str(source_id), {})) == "SegmentFrameTrimmer":
+        trim_inputs = wf[str(source_id)].setdefault("inputs", {})
+        trim_inputs["trim_frames"] = trim_frames
+        trim_inputs["tail_trim_frames"] = 0
+        if log:
+            log(f"  复用 SegmentFrameTrimmer[{source_id}] head_trim={trim_frames}")
+        return str(source_id)
+
+    trim_id = _sur_unique_node_id(wf, f"sur_wan_trim_{tag}")
+    wf[trim_id] = {
+        "class_type": "SegmentFrameTrimmer",
+        "inputs": {
+            "images": image_source,
+            "trim_frames": trim_frames,
+            "tail_trim_frames": 0,
+        },
+    }
+    inputs["images"] = [trim_id, 0]
+    if log:
+        log(f"  自动插入 SegmentFrameTrimmer[{trim_id}] head_trim={trim_frames}")
+    return trim_id
+
+
+def _sur_set_wan_tail_reference(
+    wf: dict,
+    wan_nid: str,
+    previous_video_path: str,
+    context_frames: int,
+    seg_num: int,
+    log=None,
+) -> tuple[str, int, int]:
+    prev_total, _prev_fps = _sur_probe_video_info(previous_video_path)
+    context_frames = max(1, int(context_frames or 1))
+    skip = max(0, int(prev_total) - context_frames)
+    tail_id = _sur_unique_node_id(wf, f"sur_wan_tail_{seg_num:02d}")
+    wf[tail_id] = {
+        "class_type": "VHS_LoadVideoPath",
+        "inputs": {
+            "video": os.path.realpath(previous_video_path),
+            "force_rate": 0,
+            "custom_width": 0,
+            "custom_height": 0,
+            "frame_load_cap": context_frames,
+            "skip_first_frames": skip,
+            "select_every_nth": 1,
+        },
+    }
+    wf[str(wan_nid)].setdefault("inputs", {})["start_image"] = [tail_id, 0]
+    if log:
+        if prev_total < context_frames:
+            log(f"  ⚠ 上一段只有 {prev_total} 帧，少于上下文 {context_frames} 帧，本段将使用可用尾帧")
+        log(f"  上一段尾帧: {os.path.basename(previous_video_path)} skip={skip} cap={context_frames}")
+    return tail_id, int(prev_total), int(skip)
 
 def _is_cleanup_debug_node(class_type: str) -> bool:
     name = (class_type or "").lower()
@@ -1937,6 +2225,47 @@ def _build_plan_text(total_frames, segments, start_from,
     return "\n".join(lines)
 
 
+def _build_wan_i2v_plan_text(
+    segments: int,
+    start_from: int,
+    segment_frames: int,
+    context_frames: int,
+    frame_rate: float,
+    wan_nid: str,
+    combine_nid: str,
+    pre_paths_count: int = 0,
+) -> str:
+    segments = max(1, int(segments or 1))
+    start_from = max(1, int(start_from or 1))
+    segment_frames = max(1, int(segment_frames or 1))
+    context_frames = max(1, int(context_frames or 1))
+    lines = [
+        f"WanImageToVideo 节点 ID : {wan_nid or '（未设置/未识别）'}",
+        f"VHS_VideoCombine 节点 ID: {combine_nid or '（未设置/未识别）'}",
+        f"帧率: {float(frame_rate or 0):.3g} fps",
+        f"共 {segments} 段  每段保留 {segment_frames} 帧  段间参考尾帧 {context_frames} 帧  从第 {start_from} 段开始",
+        f"预置/已完成分段路径: {pre_paths_count} 个",
+        "",
+        f"  {'段':>3}  {'Wan length':>10}  {'参考输入':>16}  {'保存前裁头':>10}  {'保存帧数':>8}  状态",
+        f"  {'-'*3}  {'-'*10}  {'-'*16}  {'-'*10}  {'-'*8}  ----",
+    ]
+    for seg_num in range(1, segments + 1):
+        length = segment_frames if seg_num == 1 else segment_frames + context_frames
+        trim = 0 if seg_num == 1 else context_frames
+        ref = "原始 start_image" if seg_num == 1 else f"上一段尾 {context_frames} 帧"
+        status = "→ 执行" if seg_num >= start_from else "  跳过"
+        lines.append(
+            f"  第{seg_num:>2}段  {length:>10}  {ref:>16}  {trim:>10}  {segment_frames:>8}  {status}"
+        )
+    lines += [
+        "",
+        "流程: 第1段生成 segment_frames；第2段起读取上一段尾帧作为 Wan start_image，",
+        "      Wan length = segment_frames + context_frames，保存前自动裁掉开头 context_frames。",
+        "输出文件命名: sur_wan_seg{段号}_{时间戳}.mp4",
+    ]
+    return "\n".join(lines)
+
+
 # ── SegmentFrameTrimmer 节点 ──────────────────────────────────────
 
 class SegmentFrameTrimmer:
@@ -2438,8 +2767,8 @@ class SegmentUpscaleRunner:
             log(f"分段输入模式 {requested_segment_io_mode} 已退役，本次自动改用 frame_window。")
 
         extra_info = extra_pnginfo if isinstance(extra_pnginfo, dict) else {}
-        full_prompt = extra_info.get("sur_full_prompt") or prompt
-        client_id   = str(extra_info.get("sur_client_id") or _sur_current_client_id() or "")
+        full_prompt = _sur_context_full_prompt(extra_info, prompt)
+        client_id   = _sur_context_client_id(extra_info)
         load_nid = _sur_auto_node_id(
             full_prompt, load_nid,
             ("VHS_LoadVideo", "VHS_LoadVideoFFmpeg", "VHS_LoadVideoPath", "VHS_LoadVideoFFmpegPath"),
@@ -2677,8 +3006,7 @@ class SegmentUpscaleRunner:
                     # 3. 修改 VHS_VideoCombine：唯一文件名前缀，避免覆盖
                     seg_prefix  = f"sur_seg{seg_num:02d}_{run_stamp}_"
                     orig_prefix = wf[combine_nid]["inputs"].get("filename_prefix", "")
-                    slash       = max(orig_prefix.rfind("/"), orig_prefix.rfind("\\"))
-                    subfolder   = physical_output_subfolder if physical_mode else (orig_prefix[:slash + 1] if slash >= 0 else "")
+                    subfolder   = physical_output_subfolder if physical_mode else _sur_output_subfolder_from_prefix(orig_prefix)
                     wf[combine_nid]["inputs"]["filename_prefix"] = subfolder + seg_prefix
                     wf[combine_nid]["inputs"]["save_output"]     = True
                     wf[combine_nid]["inputs"]["save_metadata"]   = False
@@ -2759,8 +3087,7 @@ class SegmentUpscaleRunner:
                         log("自动合并已跳过：任务未全部完成，避免生成不完整合并视频。")
                     elif len(segment_output_paths) >= 2:
                         orig_prefix = base_prompt[combine_nid]["inputs"].get("filename_prefix", "") if combine_nid in base_prompt else ""
-                        slash = max(orig_prefix.rfind("/"), orig_prefix.rfind("\\"))
-                        subfolder = physical_output_subfolder if physical_mode else (orig_prefix[:slash + 1] if slash >= 0 else "")
+                        subfolder = physical_output_subfolder if physical_mode else _sur_output_subfolder_from_prefix(orig_prefix)
                         output_root = folder_paths.get_output_directory()
                         output_dir = os.path.join(output_root, subfolder.rstrip("/\\")) if subfolder else output_root
                         os.makedirs(output_dir, exist_ok=True)
@@ -2797,6 +3124,482 @@ class SegmentUpscaleRunner:
             old = _SUR_ACTIVE_JOBS.get(job_key)
             if old is not None and old.is_alive():
                 log("✗ 已有分段任务正在运行，本次不会再启动一个后台队列")
+                return {}
+            _SUR_ACTIVE_JOBS[job_key] = thread
+
+        _interrupt_current()
+        thread.start()
+        return {}
+
+
+class SegmentWanI2VRunner:
+    CATEGORY    = "video/utils"
+    FUNCTION    = "run"
+    OUTPUT_NODE = True
+    RETURN_TYPES = ()
+    RETURN_NAMES = ()
+
+    @classmethod
+    def IS_CHANGED(cls, **kwargs):
+        return float("nan")
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "frame_rate": (
+                    "FLOAT",
+                    {
+                        "default": 16.0, "min": 1.0, "max": 120.0, "step": 1.0,
+                        "tooltip": "输出视频帧率。节点会写入每段 VHS_VideoCombine.frame_rate，合并时也按这个帧率估算。",
+                    },
+                ),
+                "segment_count": (
+                    "INT",
+                    {
+                        "default": 4, "min": 1, "max": 50, "step": 1,
+                        "display": "slider",
+                        "tooltip": "要连续生成多少段。最终总帧数约为 segment_count * segment_frames。",
+                    },
+                ),
+                "start_segment": (
+                    "INT",
+                    {
+                        "default": 1, "min": 1, "max": 50, "step": 1,
+                        "display": "slider",
+                        "tooltip": "从第几段开始。大于 1 时需要 checkpoint 或 pre_segment_paths 提供前一段视频。",
+                    },
+                ),
+                "segment_frames": (
+                    "INT",
+                    {
+                        "default": 81, "min": 1, "max": 4096, "step": 4,
+                        "tooltip": "每段最终保留的帧数。Wan2.2 常用 81。",
+                    },
+                ),
+                "context_frames": (
+                    "INT",
+                    {
+                        "default": 16, "min": 1, "max": 128, "step": 1,
+                        "tooltip": "第2段起读取上一段尾部多少帧作为 Wan start_image。常用 16。",
+                    },
+                ),
+                "execute": (
+                    "BOOLEAN",
+                    {
+                        "default": False,
+                        "tooltip": "False=仅预览分段计划，True=开始执行 Wan 图生视频分段队列。",
+                    },
+                ),
+                "wan_i2v_node_id": (
+                    "STRING",
+                    {
+                        "default": "",
+                        "tooltip": "WanImageToVideo 节点 ID。留空时如果图里只有一个 WanImageToVideo 会自动识别。",
+                    },
+                ),
+                "combine_video_node_id": (
+                    "STRING",
+                    {
+                        "default": "",
+                        "tooltip": "最终 VHS_VideoCombine 节点 ID。留空时优先自动查找 Wan 下游唯一的 VideoCombine。",
+                    },
+                ),
+                "prune_cleanup_debug_nodes": (
+                    "BOOLEAN",
+                    {
+                        "default": True,
+                        "tooltip": "从每段子 prompt 中移除预览、show、debug、VRAMCleanup 等旁路，避免额外执行。",
+                    },
+                ),
+                "clear_cache_between_segments": (
+                    "BOOLEAN",
+                    {
+                        "default": True,
+                        "tooltip": "每段完成后清理 Comfy 执行缓存和残留视频 tensor，适合长视频连续生成。",
+                    },
+                ),
+                "clear_segment_history": (
+                    "BOOLEAN",
+                    {
+                        "default": True,
+                        "tooltip": "每段成功记录输出路径后删除该子 prompt 的 history。",
+                    },
+                ),
+                "merge_segments": (
+                    "BOOLEAN",
+                    {
+                        "default": True,
+                        "tooltip": "全部完成后用 ffmpeg concat 自动合并每段保留帧视频。",
+                    },
+                ),
+                "merged_filename_prefix": (
+                    "STRING",
+                    {
+                        "default": "sur_wan_merged",
+                        "tooltip": "自动合并输出的文件名前缀，会保留 VideoCombine 原本的输出子目录。",
+                    },
+                ),
+                "enable_checkpoint": (
+                    "BOOLEAN",
+                    {
+                        "default": True,
+                        "tooltip": "每段成功后写入 checkpoint。中断或 OOM 后可续跑。",
+                    },
+                ),
+                "auto_resume_checkpoint": (
+                    "BOOLEAN",
+                    {
+                        "default": True,
+                        "tooltip": "执行时若存在本节点的 Wan checkpoint，自动从 next_seg 继续。",
+                    },
+                ),
+                "clear_checkpoint_on_finish": (
+                    "BOOLEAN",
+                    {
+                        "default": True,
+                        "tooltip": "全部完成后自动删除 checkpoint。",
+                    },
+                ),
+                "pre_segment_paths": (
+                    "STRING",
+                    {
+                        "default": "",
+                        "tooltip": "手动指定已完成的前段视频路径，逗号分隔；续跑和合并时会使用这些视频。",
+                    },
+                ),
+            },
+            "hidden": {
+                "prompt":       "PROMPT",
+                "extra_pnginfo": "EXTRA_PNGINFO",
+                "unique_id":    "UNIQUE_ID",
+            },
+        }
+
+    def run(
+        self,
+        frame_rate=16.0,
+        segment_count=4,
+        start_segment=1,
+        segment_frames=81,
+        context_frames=16,
+        execute=False,
+        wan_i2v_node_id="",
+        combine_video_node_id="",
+        prune_cleanup_debug_nodes=True,
+        clear_cache_between_segments=True,
+        clear_segment_history=True,
+        merge_segments=True,
+        merged_filename_prefix="sur_wan_merged",
+        enable_checkpoint=True,
+        auto_resume_checkpoint=True,
+        clear_checkpoint_on_finish=True,
+        pre_segment_paths="",
+        prompt=None,
+        extra_pnginfo=None,
+        unique_id=None,
+        **_legacy,
+    ):
+        frame_rate = float(frame_rate or 16.0)
+        segments = max(1, int(segment_count or 1))
+        start_from = max(1, int(start_segment or 1))
+        segment_frames = max(1, int(segment_frames or 81))
+        context_frames = max(1, int(context_frames or 16))
+        execute = _sur_bool(execute, False)
+        wan_nid = str(wan_i2v_node_id or "").strip()
+        combine_nid = str(combine_video_node_id or "").strip()
+        prune_cleanup_debug_nodes = _sur_bool(prune_cleanup_debug_nodes, True)
+        clear_cache_between_segments = _sur_bool(clear_cache_between_segments, True)
+        clear_segment_history = _sur_bool(clear_segment_history, True)
+        merge_segments = _sur_bool(merge_segments, True)
+        merged_filename_prefix = str(merged_filename_prefix or "sur_wan_merged").strip() or "sur_wan_merged"
+        enable_checkpoint = _sur_bool(enable_checkpoint, True)
+        auto_resume_checkpoint = _sur_bool(auto_resume_checkpoint, True)
+        clear_checkpoint_on_finish = _sur_bool(clear_checkpoint_on_finish, True)
+        pre_segment_paths = str(pre_segment_paths or "").strip()
+        cleanup_selectors = _parse_selectors(
+            _legacy.get(
+                "cleanup_node_selectors",
+                "DeepRAMCleanNode,SegmentDeepRAMCleanNode,VRAM_Debug,VRAMCleanup,easy showAnything,PreviewImage,SaveImage",
+            )
+        )
+        uid = unique_id
+
+        def log(msg):
+            _sur_log(uid, f"[SUR Wan] {msg}")
+
+        extra_info = extra_pnginfo if isinstance(extra_pnginfo, dict) else {}
+        full_prompt = _sur_context_full_prompt(extra_info, prompt)
+        client_id = _sur_context_client_id(extra_info)
+
+        wan_nid = _sur_auto_node_id(
+            full_prompt,
+            wan_nid,
+            ("WanImageToVideo",),
+            "wan_i2v_node_id",
+            log=log,
+        )
+        combine_nid = _sur_auto_downstream_node_id(
+            full_prompt,
+            wan_nid,
+            combine_nid,
+            "VHS_VideoCombine",
+            "combine_video_node_id",
+            log=log,
+        )
+
+        pre_paths = []
+        for raw in [p.strip() for p in pre_segment_paths.split(",") if p.strip()]:
+            resolved = _sur_resolve_media_path(raw)
+            if resolved and os.path.isfile(resolved):
+                pre_paths.append(resolved)
+            elif execute:
+                log(f"⚠ pre_segment_paths 中找不到视频，已忽略: {raw}")
+
+        if not execute:
+            plan = _build_wan_i2v_plan_text(
+                segments, start_from, segment_frames, context_frames,
+                frame_rate, wan_nid, combine_nid, len(pre_paths),
+            )
+            _sur_log(uid, "[Wan I2V 预览模式]\n" + plan)
+            _interrupt_current()
+            return {}
+
+        checks = [
+            (not isinstance(full_prompt, dict), "未取得当前 prompt，请在 ComfyUI 正常队列中运行本节点"),
+            (not wan_nid, "wan_i2v_node_id 不能为空，且未能自动识别 WanImageToVideo"),
+            (not combine_nid, "combine_video_node_id 不能为空，且未能从 Wan 下游自动识别 VHS_VideoCombine"),
+        ]
+        for cond, msg in checks:
+            if cond:
+                log(f"✗ {msg}")
+                _interrupt_current()
+                return {}
+
+        nid_checks = [(wan_nid, "WanImageToVideo"), (combine_nid, "VHS_VideoCombine")]
+        for nid, label in nid_checks:
+            if nid not in (full_prompt or {}):
+                log(f"✗ 找不到 {label} 节点 ID「{nid}」")
+                _interrupt_current()
+                return {}
+        if _node_class(full_prompt.get(wan_nid, {})) != "WanImageToVideo":
+            log(f"✗ 节点 {wan_nid} 不是 WanImageToVideo")
+            _interrupt_current()
+            return {}
+        if _node_class(full_prompt.get(combine_nid, {})) != "VHS_VideoCombine":
+            log(f"✗ 节点 {combine_nid} 不是 VHS_VideoCombine")
+            _interrupt_current()
+            return {}
+        if "images" not in _node_inputs(full_prompt.get(combine_nid, {})):
+            log(f"✗ VHS_VideoCombine[{combine_nid}] 没有 images 输入")
+            _interrupt_current()
+            return {}
+
+        ckpt = _sur_read_checkpoint(uid) if enable_checkpoint and auto_resume_checkpoint else None
+        resume_note = ""
+        run_stamp = _now_stamp()
+        if isinstance(ckpt, dict) and ckpt.get("runner_type") == "wan_i2v":
+            try:
+                next_seg = int(ckpt.get("next_seg") or 1)
+                if 1 < next_seg <= segments + 1:
+                    start_from = max(start_from, next_seg)
+                    run_stamp = str(ckpt.get("run_stamp") or run_stamp)
+                    ckpt_paths = [
+                        p for p in ckpt.get("segment_output_paths", [])
+                        if isinstance(p, str) and os.path.isfile(p)
+                    ]
+                    if ckpt_paths:
+                        pre_paths = ckpt_paths + [p for p in pre_paths if p not in ckpt_paths]
+                    resume_note = f"自动续跑: checkpoint next_seg={next_seg}, 已完成视频={len(ckpt_paths)}"
+            except Exception:
+                resume_note = "checkpoint 存在但解析失败，本次按当前参数执行"
+        elif isinstance(ckpt, dict) and ckpt:
+            resume_note = "发现非 Wan I2V checkpoint，已忽略"
+        elif enable_checkpoint and not auto_resume_checkpoint and uid:
+            _sur_clear_checkpoint(uid)
+
+        if start_from > 1 and len(pre_paths) < start_from - 1:
+            log(
+                f"✗ start_segment={start_from} 需要至少 {start_from - 1} 个已完成分段视频，"
+                f"当前只有 {len(pre_paths)} 个。请开启自动续跑或填写 pre_segment_paths。"
+            )
+            _interrupt_current()
+            return {}
+
+        segs_to_run = [seg_num for seg_num in range(start_from, segments + 1)]
+        base_prompt = copy.deepcopy(full_prompt)
+        job_key = f"wan:{uid or 'global'}"
+
+        def submit_all():
+            try:
+                log(f"{'═'*20} 开始 Wan I2V 分段 stamp={run_stamp} {'═'*20}")
+                log(f"WanImageToVideo [{wan_nid}]  VideoCombine [{combine_nid}]")
+                log(
+                    f"共{segments}段  每段保留={segment_frames}帧  "
+                    f"上下文尾帧={context_frames}帧  执行第{start_from}~{segments}段"
+                )
+                if resume_note:
+                    log(resume_note)
+                if pre_paths:
+                    log(f"前置/已完成分段: {len(pre_paths)} 个")
+                log("前端执行状态转发=" + ("开" if client_id else "关（未取得 client_id）"))
+                log(
+                    f"history清理={'开' if clear_segment_history else '关'}"
+                    + f"  段间缓存清理={'开' if clear_cache_between_segments else '关'}"
+                    + f"  自动合并={'开' if merge_segments else '关'}"
+                )
+
+                segment_output_paths: list[str] = list(pre_paths)
+                _t0 = time.time()
+                _all_done = False
+
+                if not segs_to_run:
+                    log("没有需要执行的分段；如果开启合并，将尝试使用 checkpoint/pre_segment_paths 中的视频。")
+                    if len(segment_output_paths) >= segments:
+                        _all_done = True
+
+                for run_index, seg_num in enumerate(segs_to_run):
+                    length = segment_frames if seg_num == 1 else segment_frames + context_frames
+                    head_trim = 0 if seg_num == 1 else context_frames
+                    log(
+                        f"── 第{seg_num}/{segments}段  Wan length={length}  "
+                        f"head_trim={head_trim}  保存={segment_frames}帧 ──"
+                    )
+
+                    wf = copy.deepcopy(base_prompt)
+                    removed_runners = _sur_remove_runner_nodes(wf)
+                    if removed_runners:
+                        log("  已移除 Runner 输出节点: " + ", ".join(removed_runners))
+                    removed_extra = _sur_remove_extra_video_combine_nodes(wf, combine_nid)
+                    if removed_extra:
+                        log("  已移除其他 VideoCombine 输出分支: " + ", ".join(removed_extra))
+                    if prune_cleanup_debug_nodes:
+                        pruned, blockers = _prune_in_graph_cleanup_branch(wf, cleanup_selectors)
+                        if pruned:
+                            log("  已移除图内清理/调试分支: " + ", ".join(pruned))
+                        elif blockers:
+                            log("  图内清理/调试节点连接到非调试节点，保留: " + ", ".join(blockers))
+
+                    segment_failed = False
+                    pid = ""
+                    try:
+                        _sur_set_wan_i2v_length(wf, wan_nid, length, log=log)
+                        if seg_num > 1:
+                            if len(segment_output_paths) < seg_num - 1:
+                                raise RuntimeError(f"缺少第 {seg_num - 1} 段输出视频，无法取尾帧")
+                            prev_path = segment_output_paths[seg_num - 2]
+                            _sur_set_wan_tail_reference(
+                                wf, wan_nid, prev_path,
+                                context_frames, seg_num,
+                                log=log,
+                            )
+                        else:
+                            log("  start_image: 使用原工作流输入")
+
+                        _sur_inject_wan_segment_trimmer(
+                            wf, combine_nid, head_trim,
+                            f"{seg_num:02d}",
+                            log=log,
+                        )
+
+                        seg_prefix = f"sur_wan_seg{seg_num:02d}_{run_stamp}_"
+                        combine_inputs = wf[combine_nid].setdefault("inputs", {})
+                        orig_prefix = combine_inputs.get("filename_prefix", "")
+                        subfolder = _sur_output_subfolder_from_prefix(orig_prefix)
+                        combine_inputs["filename_prefix"] = subfolder + seg_prefix
+                        combine_inputs["frame_rate"] = frame_rate
+                        combine_inputs["save_output"] = True
+                        combine_inputs["save_metadata"] = False
+
+                        pid = _queue_prompt(wf, client_id=client_id)
+                        log(f"  已提交 prompt_id={pid[:8]}...  等待完成...")
+                        ok = _wait_for_prompt(pid)
+                        if ok:
+                            log(f"✓ 第{seg_num}段完成  输出前缀: {subfolder + seg_prefix}")
+                            vpath, _ = _sur_get_output_video_info(pid, combine_nid, log=log)
+                            if vpath:
+                                segment_output_paths.append(vpath)
+                                log(f"  ✓ 输出视频: {os.path.basename(vpath)}")
+                            else:
+                                raise RuntimeError("未能从 history 读取本段输出视频路径")
+                            if seg_num == segments:
+                                _all_done = True
+                            if enable_checkpoint and uid:
+                                _sur_write_checkpoint(uid, {
+                                    "runner_type": "wan_i2v",
+                                    "unique_id": uid,
+                                    "run_stamp": run_stamp,
+                                    "completed_seg": seg_num,
+                                    "total_segs": segments,
+                                    "next_seg": min(seg_num + 1, segments + 1),
+                                    "segment_output_paths": segment_output_paths,
+                                    "segment_frames": segment_frames,
+                                    "context_frames": context_frames,
+                                    "frame_rate_used": frame_rate,
+                                    "wan_i2v_node_id": wan_nid,
+                                    "combine_video_node_id": combine_nid,
+                                    "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+                                })
+                            elapsed = time.time() - _t0
+                            _sur_save_speed_record(elapsed, segment_frames * (run_index + 1))
+                            if clear_segment_history:
+                                _sur_delete_prompt_history(pid, log=log)
+                        else:
+                            segment_failed = True
+                            log(f"✗ 第{seg_num}段执行出错，已终止后续分段")
+                    except Exception as e:
+                        segment_failed = True
+                        log(f"✗ 第{seg_num}段失败: {type(e).__name__}: {e}")
+                    finally:
+                        wf = None
+                        if pid and clear_cache_between_segments:
+                            _sur_post_segment_cache_purge(log=log, trim_working_set=True)
+
+                    if segment_failed:
+                        break
+
+                if merge_segments:
+                    if not _all_done:
+                        log("自动合并已跳过：任务未全部完成，避免生成不完整合并视频。")
+                    elif len(segment_output_paths) >= 2:
+                        orig_prefix = _node_inputs(base_prompt.get(combine_nid, {})).get("filename_prefix", "")
+                        subfolder = _sur_output_subfolder_from_prefix(orig_prefix)
+                        output_root = folder_paths.get_output_directory()
+                        output_dir = os.path.join(output_root, subfolder.rstrip("/\\")) if subfolder else output_root
+                        os.makedirs(output_dir, exist_ok=True)
+                        merged_name = f"{merged_filename_prefix}_{run_stamp}.mp4"
+                        merged_path = _sur_unique_filepath(os.path.join(output_dir, merged_name))
+                        log(f"开始合并 {len(segment_output_paths)} 段视频...")
+                        if _sur_merge_videos(segment_output_paths, merged_path, log=log):
+                            rel = (subfolder + os.path.basename(merged_path)) if subfolder else os.path.basename(merged_path)
+                            log(f"✓ 合并完成: {rel}")
+                        else:
+                            log("✗ 合并失败，请手动拼接各段视频")
+                    else:
+                        log("合并已开启，但可用分段视频少于 2 个，跳过")
+
+                if enable_checkpoint and uid:
+                    if _all_done and clear_checkpoint_on_finish:
+                        _sur_clear_checkpoint(uid)
+                        log("checkpoint 已清除（全部完成）")
+                    elif not _all_done:
+                        log("任务未全部完成，checkpoint 已保留供续跑")
+
+                log(f"{'═'*20} Wan I2V 分段完成 {'═'*20}")
+            finally:
+                with _SUR_JOB_LOCK:
+                    if _SUR_ACTIVE_JOBS.get(job_key) is threading.current_thread():
+                        _SUR_ACTIVE_JOBS.pop(job_key, None)
+
+        thread = threading.Thread(
+            target=submit_all,
+            daemon=True,
+            name=f"SUR-wan-submit-{job_key}",
+        )
+        with _SUR_JOB_LOCK:
+            old = _SUR_ACTIVE_JOBS.get(job_key)
+            if old is not None and old.is_alive():
+                log("✗ 已有 Wan I2V 分段任务正在运行，本次不会再启动一个后台队列")
                 return {}
             _SUR_ACTIVE_JOBS[job_key] = thread
 
@@ -3732,6 +4535,7 @@ async def sur_upload_video_api(request):
 
 NODE_CLASS_MAPPINGS = {
     "SegmentUpscaleRunner": SegmentUpscaleRunner,
+    "SegmentWanI2VRunner": SegmentWanI2VRunner,
     "SegmentFrameTrimmer":  SegmentFrameTrimmer,
     "SegmentVfiBridgeTrimmer": SegmentVfiBridgeTrimmer,
     "SegmentRunLogViewer":  SegmentRunLogViewer,
@@ -3741,6 +4545,7 @@ NODE_CLASS_MAPPINGS = {
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "SegmentUpscaleRunner": "Segment Upscale Runner 🎬",
+    "SegmentWanI2VRunner": "Wan2.2 I2V Segment Runner",
     "SegmentFrameTrimmer":  "Segment Final Frame Trimmer ✂️",
     "SegmentVfiBridgeTrimmer": "Segment VFI Bridge Trimmer",
     "SegmentRunLogViewer":  "Segment Run Log Viewer 📋",

@@ -34,6 +34,30 @@
       "reuse_physical_slices": "已弃用：复用分片"
     }
   },
+  "SegmentWanI2VRunner": {
+    "title": "Wan2.2 图生视频分段队列",
+    "description": "专用于标准 Wan2.2 high/low 图生视频工作流：第2段起自动读取上一段尾帧作为 start_image，生成后裁掉重复开头帧。",
+    "inputs": {},
+    "widgets": {
+      "frame_rate": "帧率",
+      "segment_count": "分段数",
+      "start_segment": "起始段",
+      "segment_frames": "每段保留帧",
+      "context_frames": "尾帧参考数",
+      "execute": "执行",
+      "wan_i2v_node_id": "Wan 图生视频节点 ID",
+      "combine_video_node_id": "视频合成节点 ID",
+      "prune_cleanup_debug_nodes": "跳过预览/调试旁路",
+      "clear_cache_between_segments": "段间缓存清理",
+      "clear_segment_history": "清理分段历史",
+      "merge_segments": "合并分段",
+      "merged_filename_prefix": "合并文件名前缀",
+      "enable_checkpoint": "启用 checkpoint",
+      "auto_resume_checkpoint": "自动续跑 checkpoint",
+      "clear_checkpoint_on_finish": "完成后清除 checkpoint",
+      "pre_segment_paths": "前置分段路径"
+    }
+  },
   "SegmentVSRFIStreamRunner": {
     "title": "SUR VSRFI 流式处理",
     "description": "适合长视频放大插帧的流式节点：从磁盘按块读源视频，跨块携带桥接帧，并直接通过 ffmpeg 写出成片。",

@@ -250,6 +250,149 @@ function markDirty(node) {
     app.graph.setDirtyCanvas?.(true, true);
 }
 
+function nodeClass(node) {
+    return node?.comfyClass || node?.type || "";
+}
+
+function isWanRunner(node) {
+    return nodeClass(node) === "SegmentWanI2VRunner";
+}
+
+function widgetValue(node, name, fallback = null) {
+    const widget = node?.widgets?.find((w) => w.name === name);
+    return widget ? widget.value : fallback;
+}
+
+function isOutputLikeNode(node) {
+    const cls = nodeClass(node);
+    const data = node?.constructor?.nodeData ?? node?.constructor?.nodeDataRaw ?? {};
+    return Boolean(data.output_node || data.outputNode)
+        || cls === "VHS_VideoCombine"
+        || cls === "PreviewImage"
+        || cls === "SaveImage"
+        || cls === "VRAMCleanup"
+        || cls === "SegmentUpscaleRunner"
+        || cls === "SegmentWanI2VRunner"
+        || cls === "SegmentVSRFIStreamRunner"
+        || cls === "SegmentRunLogViewer";
+}
+
+function serializePromptSnapshot(graph) {
+    const output = {};
+    for (const outerNode of graph.computeExecutionOrder(false)) {
+        const skipNode = outerNode.mode === 2;
+        const innerNodes = (!skipNode && outerNode.getInnerNodes) ? outerNode.getInnerNodes() : [outerNode];
+        for (const node of innerNodes) {
+            if (node.isVirtualNode || node.mode === 2) {
+                continue;
+            }
+            const inputs = {};
+            for (const i in node.widgets ?? []) {
+                const widget = node.widgets[i];
+                if (!widget.options || widget.options.serialize !== false) {
+                    inputs[widget.name] = widget.value;
+                }
+            }
+            for (let i in node.inputs ?? []) {
+                let parent = node.getInputNode?.(i);
+                let link = node.getInputLink?.(i);
+                while (parent && (parent.mode === 4 || parent.isVirtualNode)) {
+                    let found = false;
+                    if (parent.isVirtualNode) {
+                        link = parent.getInputLink?.(link?.origin_slot);
+                        if (link) {
+                            parent = parent.getInputNode?.(link.target_slot);
+                            found = Boolean(parent);
+                        }
+                    } else if (link && parent.mode === 4) {
+                        let allInputs = [link.origin_slot];
+                        if (parent.inputs) {
+                            allInputs = allInputs.concat(Object.keys(parent.inputs));
+                            for (let parentInput of allInputs) {
+                                if (parent.inputs[parentInput]?.type === node.inputs[i].type) {
+                                    link = parent.getInputLink?.(parentInput);
+                                    if (link) {
+                                        parent = parent.getInputNode?.(parentInput);
+                                    }
+                                    found = true;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    if (!found) {
+                        break;
+                    }
+                }
+                if (link) {
+                    if (parent?.updateLink) {
+                        link = parent.updateLink(link);
+                    }
+                    if (link) {
+                        inputs[node.inputs[i].name] = [String(link.origin_id), parseInt(link.origin_slot)];
+                    }
+                }
+            }
+            output[String(node.id)] = {
+                inputs,
+                class_type: nodeClass(node),
+            };
+        }
+    }
+    return output;
+}
+
+function installWanQueueIsolation(node, nodeData) {
+    if (node.__surWanQueueIsolationAdded) {
+        return;
+    }
+    const executeWidget = node.widgets?.find((w) => w.name === "execute");
+    if (!executeWidget) {
+        return;
+    }
+    node.__surWanQueueIsolationAdded = true;
+    executeWidget.beforeQueued = function () {
+        if (!isWanRunner(node) || !executeWidget.value || node.mode === 2 || node.mode === 4) {
+            return;
+        }
+
+        const graph = app.graph;
+        const previousExtra = graph.extra ? { ...graph.extra } : null;
+        graph.extra = graph.extra ?? {};
+        graph.extra.sur_full_prompt = serializePromptSnapshot(graph);
+        graph.extra.sur_client_id = api.clientId || "";
+
+        const muted = [];
+        for (const candidate of graph._nodes ?? []) {
+            if (candidate === node || candidate.mode === 2 || candidate.mode === 4) {
+                continue;
+            }
+            if (isOutputLikeNode(candidate)) {
+                muted.push([candidate, candidate.mode]);
+                candidate.mode = 4;
+            }
+        }
+
+        if (muted.length) {
+            console.log(`[SUR Wan] isolated runner ${node.id}; muted ${muted.length} output nodes for this queue`);
+        }
+        markDirty(node);
+
+        setTimeout(() => {
+            for (const [candidate, mode] of muted) {
+                candidate.mode = mode;
+            }
+            if (previousExtra) {
+                graph.extra = previousExtra;
+            } else if (graph.extra) {
+                delete graph.extra.sur_full_prompt;
+                delete graph.extra.sur_client_id;
+            }
+            markDirty(node);
+        }, 0);
+    };
+}
+
 function localizeWidgetLabels(node, nodeData) {
     const labels = text({ node, nodeData }).widgets ?? {};
     for (const widget of node.widgets ?? []) {
@@ -522,14 +665,20 @@ function addUploadButton(node, nodeData, videoPanel) {
 app.registerExtension({
     name: "Comfyui-Segment-Upscale-Runner.StreamUI",
     beforeRegisterNodeDef(nodeType, nodeData) {
-        if (nodeData?.name !== "SegmentVSRFIStreamRunner") {
+        if (nodeData?.name === "SegmentVSRFIStreamRunner") {
+            chainCallback(nodeType.prototype, "onNodeCreated", function () {
+                localizeWidgetLabels(this, nodeData);
+                addHelpWidget(this, nodeData);
+                const panel = addVideoPanel(this, nodeData);
+                addUploadButton(this, nodeData, panel);
+            });
             return;
         }
-        chainCallback(nodeType.prototype, "onNodeCreated", function () {
-            localizeWidgetLabels(this, nodeData);
-            addHelpWidget(this, nodeData);
-            const panel = addVideoPanel(this, nodeData);
-            addUploadButton(this, nodeData, panel);
-        });
+        if (nodeData?.name === "SegmentWanI2VRunner") {
+            chainCallback(nodeType.prototype, "onNodeCreated", function () {
+                localizeWidgetLabels(this, nodeData);
+                installWanQueueIsolation(this, nodeData);
+            });
+        }
     },
 });

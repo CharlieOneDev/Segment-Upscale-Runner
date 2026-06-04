@@ -113,6 +113,80 @@
       }
     }
   },
+  "SegmentWanI2VRunner": {
+    "display_name": "Wan2.2 图生视频分段队列",
+    "description": "专用于标准 Wan2.2 high/low 图生视频工作流：第2段起自动读取上一段尾帧作为 start_image，生成后裁掉重复开头帧。",
+    "inputs": {
+      "frame_rate": {
+        "name": "帧率",
+        "tooltip": "输出视频帧率。"
+      },
+      "segment_count": {
+        "name": "分段数",
+        "tooltip": "要连续生成多少段。"
+      },
+      "start_segment": {
+        "name": "起始段",
+        "tooltip": "从第几段开始。大于 1 时需要 checkpoint 或 pre_segment_paths。"
+      },
+      "segment_frames": {
+        "name": "每段保留帧",
+        "tooltip": "每段最终保留的帧数，Wan2.2 常用 81。"
+      },
+      "context_frames": {
+        "name": "尾帧参考数",
+        "tooltip": "第2段起读取上一段尾部多少帧作为 Wan start_image，常用 16。"
+      },
+      "execute": {
+        "name": "执行",
+        "tooltip": "关闭 = 预览计划；开启 = 开始执行。"
+      },
+      "wan_i2v_node_id": {
+        "name": "Wan 图生视频节点 ID",
+        "tooltip": "WanImageToVideo 节点 ID。留空时可自动识别唯一节点。"
+      },
+      "combine_video_node_id": {
+        "name": "视频合成节点 ID",
+        "tooltip": "最终 VHS_VideoCombine 节点 ID。留空时优先自动查找 Wan 下游唯一节点。"
+      },
+      "prune_cleanup_debug_nodes": {
+        "name": "跳过预览/调试旁路",
+        "tooltip": "移除子 prompt 中的预览、show、debug、VRAMCleanup 等旁路。"
+      },
+      "clear_cache_between_segments": {
+        "name": "段间缓存清理",
+        "tooltip": "每段完成后清理 Comfy 执行缓存和残留视频 tensor。"
+      },
+      "clear_segment_history": {
+        "name": "清理分段历史",
+        "tooltip": "记录输出路径后删除每段子 prompt 的 history。"
+      },
+      "merge_segments": {
+        "name": "合并分段",
+        "tooltip": "所有分段完成后使用 ffmpeg concat 合并视频。"
+      },
+      "merged_filename_prefix": {
+        "name": "合并文件名前缀",
+        "tooltip": "合并视频的文件名前缀。"
+      },
+      "enable_checkpoint": {
+        "name": "启用 checkpoint",
+        "tooltip": "每段成功后写入续跑记录。"
+      },
+      "auto_resume_checkpoint": {
+        "name": "自动续跑 checkpoint",
+        "tooltip": "存在 checkpoint 时自动从 next_seg 续跑。"
+      },
+      "clear_checkpoint_on_finish": {
+        "name": "完成后清除 checkpoint",
+        "tooltip": "全部完成后自动删除 checkpoint。"
+      },
+      "pre_segment_paths": {
+        "name": "前置分段路径",
+        "tooltip": "逗号分隔的已完成分段视频，用于手动续跑和合并。"
+      }
+    }
+  },
   "SegmentVSRFIStreamRunner": {
     "display_name": "SUR VSRFI 流式处理",
     "description": "适合长视频放大插帧的流式节点：从磁盘按块读源视频，跨块携带桥接帧，并直接通过 ffmpeg 写出成片。",
